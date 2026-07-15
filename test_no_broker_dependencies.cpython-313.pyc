@@ -1,0 +1,16 @@
+from streamlit.testing.v1 import AppTest
+
+
+def test_mobile_ui_smoke():
+    app = AppTest.from_file("mobile_app.py", default_timeout=90)
+    app.run(timeout=90)
+    assert not app.exception
+    assert [tab.label for tab in app.tabs] == [
+        "SIGNAL",
+        "CHART",
+        "LEVELS",
+        "MOMENTUM",
+        "TRADINGVIEW",
+        "MORE",
+    ]
+    assert any(button.label == "REFRESH" for button in app.button)

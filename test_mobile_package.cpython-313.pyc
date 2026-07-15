@@ -1,0 +1,58 @@
+from gold_web_terminal.models import IndicatorSnapshot, LiquiditySnapshot
+from gold_web_terminal.strategy import build_technical_report
+
+
+def _snapshot(tf: str, score: float, trend: str, momentum: str, adx: float, chop: float, compression: bool = False):
+    return IndicatorSnapshot(
+        timeframe=tf,
+        timestamp="2026-01-01T00:00:00+00:00",
+        close=4000,
+        ema9=4000,
+        ema20=3998 if score > 0 else 4002,
+        ema50=3990 if score > 0 else 4010,
+        ema200=3950 if score > 0 else 4050,
+        rsi14=60 if score > 0 else 40,
+        atr14=10,
+        atr_pct=0.25,
+        macd_hist=1 if score > 0 else -1,
+        macd_hist_slope=0.2 if score > 0 else -0.2,
+        adx14=adx,
+        plus_di=30 if score > 0 else 10,
+        minus_di=10 if score > 0 else 30,
+        vwap=3995 if score > 0 else 4005,
+        volume_ratio=1.2,
+        volume_delta_proxy=100 if score > 0 else -100,
+        choppiness14=chop,
+        supertrend=3990 if score > 0 else 4010,
+        supertrend_direction="bullish" if score > 0 else "bearish",
+        trend=trend,
+        momentum=momentum,
+        directional_score=score,
+        compression=compression,
+    )
+
+
+def test_strong_trend_returns_buy_not_wait():
+    indicators = [_snapshot(tf, 70, "bullish", "bullish", 32, 42) for tf in ["M5", "M15", "H1", "H4", "D1"]]
+    report = build_technical_report("XAU/USD", "2026-01-01", 4000, indicators, [LiquiditySnapshot(timeframe="H1")], "DEMO")
+    assert report.market_state == "BUY"
+    assert report.active_setup is not None
+    assert report.active_setup.status == "ENTER"
+
+
+def test_compressed_range_returns_stuck():
+    indicators = [_snapshot(tf, 1, "neutral", "neutral", 12, 68, True) for tf in ["M5", "M15", "H1", "H4", "D1"]]
+    report = build_technical_report("XAU/USD", "2026-01-01", 4000, indicators, [LiquiditySnapshot(timeframe="H1")], "DEMO")
+    assert report.market_state == "STUCK"
+    assert report.active_setup is None
+
+
+def test_two_sided_liquidity_sweep_returns_trap():
+    indicators = [_snapshot(tf, 10, "neutral", "neutral", 20, 52) for tf in ["M5", "M15", "H1", "H4", "D1"]]
+    liquidity = [
+        LiquiditySnapshot(timeframe="M15", sweep_above=4010, trap_type="bull_trap"),
+        LiquiditySnapshot(timeframe="H1", sweep_below=3990, trap_type="bear_trap"),
+    ]
+    report = build_technical_report("XAU/USD", "2026-01-01", 4000, indicators, liquidity, "DEMO")
+    assert report.market_state == "TRAP"
+    assert report.active_setup is None

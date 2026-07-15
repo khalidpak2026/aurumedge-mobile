@@ -1,0 +1,18 @@
+# iPhone chart fix — v5.1
+
+The previous mobile build used Streamlit's Plotly frontend. On some iPhone Safari/PWA sessions it can show:
+
+`TypeError: Importing a module script failed.`
+
+Version 5.1 replaces all Plotly panels used by the mobile app with server-generated inline SVG. The chart therefore does not depend on a JavaScript module and works in Safari and Home Screen web-app mode.
+
+## Update your GitHub repository
+
+Upload and replace these two files:
+
+1. `mobile_app.py`
+2. `gold_web_terminal/mobile_svg.py`
+
+Then Streamlit Community Cloud will redeploy automatically. If it does not, open the app menu and choose **Reboot app**.
+
+No change is required in Streamlit Secrets.

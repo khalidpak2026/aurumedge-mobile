@@ -1,9 +1,7 @@
-streamlit>=1.39
-openai>=2.0.0
-pydantic>=2.8
-pandas>=2.2
-numpy>=1.26
-plotly>=5.24
-python-dotenv>=1.0
-requests>=2.32
-pytest>=8.0
+.env
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+data/
+.streamlit/secrets.toml

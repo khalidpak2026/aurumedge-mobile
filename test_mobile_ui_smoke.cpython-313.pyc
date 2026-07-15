@@ -1,0 +1,22 @@
+from pathlib import Path
+import re
+
+
+def test_mobile_files_present():
+    root = Path(__file__).resolve().parents[1]
+    assert (root / "mobile_app.py").exists()
+    assert (root / "run_mobile_terminal.bat").exists()
+    assert (root / "README_MOBILE.md").exists()
+
+
+def test_no_embedded_secret_keys():
+    root = Path(__file__).resolve().parents[1]
+    openai_secret = re.compile(r"sk-(?:proj-)?[A-Za-z0-9_-]{30,}")
+    long_hex_secret = re.compile(r"(?<![A-Fa-f0-9])[A-Fa-f0-9]{32,64}(?![A-Fa-f0-9])")
+    for path in root.rglob("*"):
+        if path.is_file() and path.suffix.lower() in {".py", ".md", ".toml", ".txt", ".bat", ".sh", ".example"}:
+            text = path.read_text(encoding="utf-8", errors="ignore")
+            assert openai_secret.search(text) is None, path
+            # Ignore hashes only in tests/documentation; the package has no real 32-char market-data key.
+            if path.name != "test_mobile_package.py":
+                assert long_hex_secret.search(text) is None, path

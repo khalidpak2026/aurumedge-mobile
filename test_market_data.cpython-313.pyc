@@ -1,0 +1,47 @@
+from gold_web_terminal.demo_data import generate_demo_bars
+from gold_web_terminal.indicators import add_indicators, summarize_indicators
+from gold_web_terminal.liquidity import analyze_liquidity
+from gold_web_terminal.strategy import build_technical_report
+
+
+def _report():
+    timeframes = ["M5", "M15", "H1", "H4", "D1"]
+    frames = {tf: add_indicators(generate_demo_bars(tf, 500)) for tf in timeframes}
+    indicators = [summarize_indicators(frames[tf], tf) for tf in timeframes]
+    liquidity = [analyze_liquidity(frames[tf], tf) for tf in ["M15", "H1", "H4", "D1"]]
+    latest = frames["M5"].iloc[-1]
+    return build_technical_report(
+        symbol="XAU/USD-DEMO",
+        data_time=str(latest["time"]),
+        price=float(latest["close"]),
+        indicators=indicators,
+        liquidity=liquidity,
+        data_source="DEMO",
+    )
+
+
+def test_report_returns_direction_or_market_warning_without_wait():
+    report = _report()
+    assert report.market_state in {"BUY", "SELL", "STUCK", "TRAP"}
+    assert report.recommendation != "WAIT"
+    assert report.signal_label
+
+
+def test_report_has_structured_buy_and_sell_levels():
+    report = _report()
+    assert report.buy_setup.stop_loss < report.buy_setup.entry_low
+    assert report.sell_setup.stop_loss > report.sell_setup.entry_high
+    assert report.buy_setup.take_profit_3 > report.buy_setup.entry_high
+    assert report.sell_setup.take_profit_3 < report.sell_setup.entry_low
+    assert report.buy_setup.risk_reward_3 > report.buy_setup.risk_reward_1
+    assert report.sell_setup.risk_reward_3 > report.sell_setup.risk_reward_1
+
+
+def test_liquidity_and_advanced_indicators_are_present():
+    report = _report()
+    h1 = next(item for item in report.indicators if item.timeframe == "H1")
+    assert h1.choppiness14 is not None
+    assert h1.supertrend is not None
+    assert h1.directional_score != 0 or h1.trend == "neutral"
+    h1_liq = next(item for item in report.liquidity if item.timeframe == "H1")
+    assert h1_liq.point_of_control is not None

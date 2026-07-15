@@ -1,56 +1,35 @@
-@echo off
-setlocal EnableExtensions EnableDelayedExpansion
-cd /d "%~dp0"
-title AurumEdge Mobile - iPhone Terminal
+from __future__ import annotations
 
-echo ============================================================
-echo AurumEdge Mobile v5 - iPhone / mobile web terminal
-echo No MetaTrader. No broker login. No order execution.
-echo ============================================================
+import sys
 
-if not exist ".env" (
-  echo Locating your existing API configuration...
-  for %%F in (
-    "%~dp0..\.env"
-    "%~dp0..\gold_ai_web_terminal_pro_v4\.env"
-    "%~dp0..\gold_ai_web_terminal_pro_v3\.env"
-    "%~dp0..\gold_ai_web_terminal\.env"
-    "%USERPROFILE%\Downloads\gold_ai_web_terminal_pro_v4\.env"
-    "%USERPROFILE%\Downloads\gold_ai_web_terminal_pro_v3\.env"
-    "%USERPROFILE%\Desktop\gold_ai_web_terminal_pro_v4\.env"
-    "%USERPROFILE%\Desktop\gold_ai_web_terminal_pro_v3\.env"
-  ) do (
-    if not exist ".env" if exist "%%~F" copy /Y "%%~F" ".env" >nul
-  )
-)
-if not exist ".env" copy ".env.example" ".env" >nul
+from dotenv import load_dotenv
 
-if not exist ".venv\Scripts\python.exe" (
-  py -3.11 -m venv .venv 2>nul
-  if errorlevel 1 py -m venv .venv
-  if errorlevel 1 goto :error
-)
-call ".venv\Scripts\activate.bat"
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
-if errorlevel 1 goto :error
+from gold_web_terminal.config import Settings
+from gold_web_terminal.market_data import TwelveDataClient
 
-for /f "tokens=2 delims=:" %%A in ('ipconfig ^| findstr /c:"IPv4 Address"') do (
-  set IP=%%A
-  set IP=!IP: =!
-  goto :gotip
-)
-:gotip
-echo.
-echo Laptop: http://localhost:8515
-echo iPhone on same Wi-Fi: http://!IP!:8515
-echo Keep this window and laptop running for local access.
-echo.
-start "" http://localhost:8515
-python -m streamlit run mobile_app.py --server.port 8515 --server.address 0.0.0.0 --browser.gatherUsageStats false --server.headless true
-exit /b 0
 
-:error
-echo Installation failed. Install Python 3.11 or newer and run again.
-pause
-exit /b 1
+def main() -> int:
+    load_dotenv()
+    settings = Settings.from_env()
+    print("Gold AI Professional Web Terminal diagnostics")
+    print(f"Python: {sys.version.split()[0]}")
+    print(f"OpenAI key configured: {bool(settings.openai_api_key)}")
+    print(f"Twelve Data key configured: {bool(settings.twelve_data_api_key)}")
+    print(f"Automatic research: {settings.auto_research}")
+    print("Broker connection: disabled / not present")
+    print("Order execution: disabled / not present")
+    if settings.twelve_data_api_key:
+        try:
+            frame, has_volume = TwelveDataClient(settings.twelve_data_api_key).fetch(settings.market_symbol, "H1", 250)
+            print(f"Market data: OK ({len(frame)} H1 bars, latest close {frame.iloc[-1]['close']})")
+            print(f"Provider volume present: {has_volume}")
+        except Exception as exc:
+            print(f"Market data: FAILED - {exc}")
+            return 2
+    else:
+        print("Market data: skipped because TWELVE_DATA_API_KEY is empty")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

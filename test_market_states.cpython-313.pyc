@@ -1,0 +1,12 @@
+from pathlib import Path
+
+
+def test_no_broker_or_anthropic_python_dependencies():
+    root = Path(__file__).resolve().parents[1]
+    requirements = (root / "requirements.txt").read_text(encoding="utf-8").lower()
+    assert "metatrader" not in requirements
+    assert "anthropic" not in requirements
+    source_files = [path for path in root.rglob("*.py") if "tests" not in path.parts]
+    python_text = "\n".join(path.read_text(encoding="utf-8").lower() for path in source_files)
+    forbidden_imports = ("import metatrader5", "from metatrader5", "import anthropic", "from anthropic")
+    assert not any(item in python_text for item in forbidden_imports)
