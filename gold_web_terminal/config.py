@@ -64,6 +64,10 @@ class Settings:
     us10y_symbol: str
     macro_cache_minutes: int
 
+    # Automatic full-market synchronization.
+    auto_refresh_enabled: bool
+    auto_refresh_seconds: int
+
     @classmethod
     def from_env(cls) -> "Settings":
         return cls(
@@ -97,5 +101,7 @@ class Settings:
             macro_required_for_entry=_as_bool(os.getenv("MACRO_REQUIRED_FOR_ENTRY", "true"), True),
             dxy_symbol=os.getenv("DXY_SYMBOL", "DXY"),
             us10y_symbol=os.getenv("US10Y_SYMBOL", "US10Y"),
-            macro_cache_minutes=max(2, _as_int("MACRO_CACHE_MINUTES", 5)),
+            macro_cache_minutes=max(2, _as_int("MACRO_CACHE_MINUTES", 10)),
+            auto_refresh_enabled=_as_bool(os.getenv("AUTO_REFRESH_ENABLED", "true"), True),
+            auto_refresh_seconds=max(60, _as_int("AUTO_REFRESH_SECONDS", 90)),
         )

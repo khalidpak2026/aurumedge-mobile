@@ -52,6 +52,11 @@ class IndicatorSnapshot(BaseModel):
     trend: Direction = "neutral"
     momentum: Direction = "neutral"
     directional_score: float = Field(default=0.0, ge=-100, le=100)
+    impulse_1_atr: float | None = None
+    impulse_3_atr: float | None = None
+    close_location: float | None = None
+    structure_break_up: bool = False
+    structure_break_down: bool = False
 
 
 class LiquiditySnapshot(BaseModel):
@@ -70,6 +75,8 @@ class LiquiditySnapshot(BaseModel):
     bearish_fvgs: list[dict] = Field(default_factory=list)
     sweep_above: float | None = None
     sweep_below: float | None = None
+    sweep_above_age: int | None = None
+    sweep_below_age: int | None = None
     trap_type: Literal["bull_trap", "bear_trap", "none"] = "none"
     nearest_support: float | None = None
     nearest_resistance: float | None = None

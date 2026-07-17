@@ -160,25 +160,40 @@ def analyze_liquidity(df: pd.DataFrame, timeframe: str) -> LiquiditySnapshot:
         previous_day_high = float(recent.loc[previous_mask, "high"].max())
         previous_day_low = float(recent.loc[previous_mask, "low"].min())
 
-    last_three = recent.tail(3)
     last = recent.iloc[-1]
     sweep_above = None
     sweep_below = None
+    sweep_above_age = None
+    sweep_below_age = None
     trap_type = "none"
     all_resistance_levels = swing_highs[:-1] + equal_highs
     all_support_levels = swing_lows[:-1] + equal_lows
+
+    # Detect the actual bar that performed the sweep.  A trap is deliberately a
+    # short-lived event: M15/H1 classifiers can use the age to expire it after
+    # one or two candles instead of carrying it through an entire trend move.
     if all_resistance_levels:
         candidate = min(all_resistance_levels, key=lambda level: abs(level - close))
-        if float(last_three["high"].max()) > candidate + tolerance * 0.15 and float(last["close"]) < candidate:
-            sweep_above = candidate
-            if float(last["close"]) < float(last["open"]):
-                trap_type = "bull_trap"
+        for age in range(min(3, len(recent))):
+            candle = recent.iloc[-1 - age]
+            if float(candle["high"]) > candidate + tolerance * 0.15 and float(candle["close"]) < candidate:
+                sweep_above = candidate
+                sweep_above_age = age
+                if float(candle["close"]) < float(candle["open"]):
+                    trap_type = "bull_trap"
+                break
     if all_support_levels:
         candidate = min(all_support_levels, key=lambda level: abs(level - close))
-        if float(last_three["low"].min()) < candidate - tolerance * 0.15 and float(last["close"]) > candidate:
-            sweep_below = candidate
-            if float(last["close"]) > float(last["open"]):
-                trap_type = "bear_trap"
+        for age in range(min(3, len(recent))):
+            candle = recent.iloc[-1 - age]
+            if float(candle["low"]) < candidate - tolerance * 0.15 and float(candle["close"]) > candidate:
+                sweep_below = candidate
+                sweep_below_age = age
+                if float(candle["close"]) > float(candle["open"]):
+                    # Prefer the most recent sweep when both sides were taken.
+                    if sweep_above_age is None or age <= sweep_above_age:
+                        trap_type = "bear_trap"
+                break
 
     bullish_fvgs, bearish_fvgs = _fair_value_gaps(recent)
     poc, vah, val = _volume_profile(recent.tail(180))
@@ -206,6 +221,8 @@ def analyze_liquidity(df: pd.DataFrame, timeframe: str) -> LiquiditySnapshot:
         bearish_fvgs=bearish_fvgs,
         sweep_above=_finite(sweep_above),
         sweep_below=_finite(sweep_below),
+        sweep_above_age=sweep_above_age,
+        sweep_below_age=sweep_below_age,
         trap_type=trap_type,
         nearest_support=max(supports) if supports else None,
         nearest_resistance=min(resistances) if resistances else None,

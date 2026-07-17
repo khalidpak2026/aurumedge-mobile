@@ -178,9 +178,10 @@ class TwelveDataClient:
         - M5 (M15 is derived)
         - H1 with enough history to derive H4 and at least 200 D1 bars
 
-        This leaves six free-plan credits available for the exact six-currency
-        DXY basket, keeping a full technical + macro refresh within eight
-        Twelve Data credits.
+        This limits each all-timeframe gold synchronization to two provider
+        series. Macro assets are loaded through their independent cached source
+        hierarchy, so changing the visible timeframe never spends extra candle
+        credits.
         """
         requested = list(dict.fromkeys(timeframes))
         invalid = [tf for tf in requested if tf not in INTERVAL_MAP]
@@ -228,8 +229,8 @@ class TwelveDataClient:
         latest = reference.iloc[-1]
         notes = [
             "Price and candles are indicative web-market data, not an executable broker quote.",
-            f"Macro-ready quota plan: {', '.join(provider_calls)} requested from Twelve Data; M15, H4 and D1 are derived locally.",
-            "The exact synthetic DXY basket uses the six remaining Twelve Data credits and is cached separately.",
+            f"Quota-safe all-timeframe plan: {', '.join(provider_calls)} requested from Twelve Data; M15, H4 and D1 are derived locally.",
+            "Changing the visible timeframe uses the synchronized in-memory snapshot and makes no new provider request.",
         ]
         if self.last_credits_left is not None:
             notes.append(f"Provider-reported API credits left after the latest candle request: {self.last_credits_left}.")

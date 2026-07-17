@@ -170,13 +170,52 @@ def _liquidity_context(liquidity: list[LiquiditySnapshot], price: float) -> dict
             bull_traps.append(item.timeframe)
         if item.trap_type == "bear_trap" or item.sweep_below is not None:
             bear_traps.append(item.timeframe)
+    active_timeframes = {"M15", "H1"}
+
+    def _fresh(item: LiquiditySnapshot, side: str) -> bool:
+        age = item.sweep_above_age if side == "above" else item.sweep_below_age
+        if age is None:
+            return False
+        # M15 traps may affect the current and immediately following candle.
+        # H1 traps affect only the current H1 candle.  Older sweeps remain chart
+        # context but must not freeze execution for hours.
+        return age <= (1 if item.timeframe == "M15" else 0)
+
+    bull_trap_levels = {
+        item.timeframe: float(item.sweep_above)
+        for item in liquidity
+        if item.timeframe in active_timeframes and item.sweep_above is not None and _fresh(item, "above")
+    }
+    bear_trap_levels = {
+        item.timeframe: float(item.sweep_below)
+        for item in liquidity
+        if item.timeframe in active_timeframes and item.sweep_below is not None and _fresh(item, "below")
+    }
+    bull_trap_ages = {
+        item.timeframe: int(item.sweep_above_age)
+        for item in liquidity
+        if item.timeframe in bull_trap_levels and item.sweep_above_age is not None
+    }
+    bear_trap_ages = {
+        item.timeframe: int(item.sweep_below_age)
+        for item in liquidity
+        if item.timeframe in bear_trap_levels and item.sweep_below_age is not None
+    }
+    two_sided_timeframes = sorted(set(bull_trap_levels) & set(bear_trap_levels))
     return {
         "supports": sorted(set(round(level, 5) for level in supports), reverse=True),
         "resistances": sorted(set(round(level, 5) for level in resistances)),
         "nearest_support": max(supports) if supports else None,
         "nearest_resistance": min(resistances) if resistances else None,
+        # All-timeframe lists remain useful as context and chart labels.  The
+        # execution classifier below only treats fresh M15/H1 sweeps as a trap.
         "bull_traps": bull_traps,
         "bear_traps": bear_traps,
+        "bull_trap_levels": bull_trap_levels,
+        "bear_trap_levels": bear_trap_levels,
+        "bull_trap_ages": bull_trap_ages,
+        "bear_trap_ages": bear_trap_ages,
+        "two_sided_timeframes": two_sided_timeframes,
     }
 
 
@@ -387,6 +426,9 @@ def build_technical_report(
     risk_inputs: RiskInputs | None = None,
     macro: MacroConfirmation | None = None,
     macro_required_for_entry: bool = True,
+    previous_state: str | None = None,
+    trap_anchor_price: float | None = None,
+    trap_age: int = 0,
 ) -> TechnicalReport:
     if not indicators:
         raise ValueError("At least one indicator snapshot is required.")
@@ -428,25 +470,149 @@ def build_technical_report(
     average_adx = float(stats["average_adx"])
     average_chop = float(stats["average_chop"])
     compression_count = int(stats["compressions"])
-    strong_bull_trap = bool(liq["bull_traps"] and h1.momentum != "bullish")
-    strong_bear_trap = bool(liq["bear_traps"] and h1.momentum != "bearish")
-    both_sides_swept = bool(liq["bull_traps"] and liq["bear_traps"])
-
-    stuck = (
-        (average_adx < 17.5 and average_chop > 61.0)
-        or (compression_count >= 2 and average_adx < 20)
-        or (h1.trend == "neutral" and h4.trend == "neutral" and abs(bullish - bearish) < 8)
-    )
-    trap = both_sides_swept or (strong_bull_trap and strong_bear_trap)
-    breakout_up = bool(stats["breakout_up"] and (m15.volume_ratio or 0) >= 1.05)
-    breakout_down = bool(stats["breakout_down"] and (m15.volume_ratio or 0) >= 1.05)
+    breakout_up = bool(stats["breakout_up"] and (m15.volume_ratio or 0) >= 1.02)
+    breakout_down = bool(stats["breakout_down"] and (m15.volume_ratio or 0) >= 1.02)
     net = bullish - bearish
 
-    if not trap and strong_bull_trap and net > -5:
-        trap = True
-    if not trap and strong_bear_trap and net < 5:
-        trap = True
+    # Directional resolution is evaluated before the trap label.  A liquidity
+    # sweep is an event, not a market regime.  Strong displacement, a local
+    # structure break and aligned momentum must immediately release the engine
+    # into BUY or SELL even while slower H1/H4 EMAs are still catching up.
+    h1_adx = float(h1.adx14 or 0.0)
+    bull_dmi = h1_adx >= 18 and float(h1.plus_di or 0) > float(h1.minus_di or 0)
+    bear_dmi = h1_adx >= 18 and float(h1.minus_di or 0) > float(h1.plus_di or 0)
+    bull_momentum = h1.momentum == "bullish" and (m15.momentum == "bullish" or breakout_up or m15.structure_break_up)
+    bear_momentum = h1.momentum == "bearish" and (m15.momentum == "bearish" or breakout_down or m15.structure_break_down)
+    h1_above_value = h1.close > float(h1.ema20 or h1.vwap or h1.close)
+    h1_below_value = h1.close < float(h1.ema20 or h1.vwap or h1.close)
+    h1_above_fast = h1.close > float(h1.ema9 or h1.ema20 or h1.close)
+    h1_below_fast = h1.close < float(h1.ema9 or h1.ema20 or h1.close)
 
+    m15_bull_impulse = bool(
+        ((m15.impulse_1_atr or 0) >= 0.42 or (m15.impulse_3_atr or 0) >= 0.78)
+        and (m15.close_location or 0.5) >= 0.62
+        and (m15.volume_ratio or 1.0) >= 0.90
+    )
+    m15_bear_impulse = bool(
+        ((m15.impulse_1_atr or 0) <= -0.42 or (m15.impulse_3_atr or 0) <= -0.78)
+        and (m15.close_location or 0.5) <= 0.38
+        and (m15.volume_ratio or 1.0) >= 0.90
+    )
+    h1_bull_impulse = bool(
+        (h1.impulse_1_atr or 0) >= 0.30
+        or (h1.impulse_3_atr or 0) >= 0.60
+        or ((h1.macd_hist_slope or 0) > 0 and h1_above_fast)
+    )
+    h1_bear_impulse = bool(
+        (h1.impulse_1_atr or 0) <= -0.30
+        or (h1.impulse_3_atr or 0) <= -0.60
+        or ((h1.macd_hist_slope or 0) < 0 and h1_below_fast)
+    )
+
+    fast_break_up = bool(breakout_up or m15.structure_break_up)
+    fast_break_down = bool(breakout_down or m15.structure_break_down)
+    bullish_resolution = bool(
+        m15_bull_impulse
+        and fast_break_up
+        and (h1_bull_impulse or bull_dmi or h1_above_fast)
+        and net >= -14
+    )
+    bearish_resolution = bool(
+        m15_bear_impulse
+        and fast_break_down
+        and (h1_bear_impulse or bear_dmi or h1_below_fast)
+        and net <= 14
+    )
+
+    bullish_confirmation = bool(
+        bullish_resolution
+        or (
+            net >= 10
+            and (
+                (h1.trend == "bullish" and h4.trend in {"bullish", "neutral"} and (bull_momentum or bull_dmi))
+                or (fast_break_up and (bull_momentum or m15_bull_impulse) and (h1_above_value or h1_bull_impulse))
+                or (net >= 24 and bull_momentum and h1_above_value)
+            )
+        )
+    )
+    bearish_confirmation = bool(
+        bearish_resolution
+        or (
+            net <= -10
+            and (
+                (h1.trend == "bearish" and h4.trend in {"bearish", "neutral"} and (bear_momentum or bear_dmi))
+                or (fast_break_down and (bear_momentum or m15_bear_impulse) and (h1_below_value or h1_bear_impulse))
+                or (net <= -24 and bear_momentum and h1_below_value)
+            )
+        )
+    )
+
+    bull_trap_levels: dict[str, float] = liq.get("bull_trap_levels", {})
+    bear_trap_levels: dict[str, float] = liq.get("bear_trap_levels", {})
+    bull_trap_near = any(abs(price - level) <= h1_atr * 0.45 for level in bull_trap_levels.values())
+    bear_trap_near = any(abs(price - level) <= h1_atr * 0.45 for level in bear_trap_levels.values())
+    two_sided_fresh = bool(liq.get("two_sided_timeframes"))
+
+    # Same-side sweeps support the opposite direction.  They only create a
+    # temporary no-trade TRAP when price has not yet resolved and the attempted
+    # move is directly contradicted.  A confirmed directional impulse always
+    # overrides the trap label.
+    liquidity_conflict = bool(
+        (bull_trap_near and bullish_confirmation and not bearish_resolution and not bullish_resolution)
+        or (bear_trap_near and bearish_confirmation and not bullish_resolution and not bearish_resolution)
+    )
+    unresolved_two_sided = bool(
+        two_sided_fresh
+        and abs(net) < 36
+        and not bullish_resolution
+        and not bearish_resolution
+        and not bullish_confirmation
+        and not bearish_confirmation
+    )
+    trap = bool(liquidity_conflict or unresolved_two_sided)
+
+    trap_release_side: str | None = None
+    if bullish_resolution:
+        trap = False
+        bullish_confirmation = True
+        bearish_confirmation = False
+        if previous_state == "TRAP":
+            trap_release_side = "BUY"
+            buy_reasons.append("The prior liquidity event resolved into a confirmed bullish structure break")
+    elif bearish_resolution:
+        trap = False
+        bearish_confirmation = True
+        bullish_confirmation = False
+        if previous_state == "TRAP":
+            trap_release_side = "SELL"
+            sell_reasons.append("The prior liquidity event resolved into a confirmed bearish structure break")
+    elif trap and previous_state == "TRAP" and trap_anchor_price is not None:
+        displacement_r = (price - float(trap_anchor_price)) / h1_atr
+        if trap_age >= 2:
+            # A trap may block at most two refresh cycles without fresh evidence.
+            trap = False
+        elif displacement_r >= 0.45 and net >= 4 and (m15_bull_impulse or bull_momentum or bull_dmi):
+            trap = False
+            bullish_confirmation = True
+            bearish_confirmation = False
+            trap_release_side = "BUY"
+            buy_reasons.append("Price displaced above the prior trap anchor and held bullish momentum")
+        elif displacement_r <= -0.45 and net <= -4 and (m15_bear_impulse or bear_momentum or bear_dmi):
+            trap = False
+            bearish_confirmation = True
+            bullish_confirmation = False
+            trap_release_side = "SELL"
+            sell_reasons.append("Price displaced below the prior trap anchor and held bearish momentum")
+
+    stuck = (
+        not bullish_confirmation
+        and not bearish_confirmation
+        and (
+            (average_adx < 17.5 and average_chop > 61.0)
+            or (compression_count >= 2 and average_adx < 20)
+            or (h1.trend == "neutral" and h4.trend == "neutral" and abs(net) < 8)
+        )
+    )
     if atr_pct >= 0.85:
         volatility_state = "extreme"
     elif atr_pct >= 0.48:
@@ -460,36 +626,65 @@ def build_technical_report(
     if trap:
         market_state = "TRAP"
         regime = "liquidity_trap"
-        signal_label = "NO TRADE · LIQUIDITY TRAP"
-        if both_sides_swept:
-            trap_reason = "Liquidity was taken on both sides; the apparent direction is vulnerable to stop-hunting."
-        elif strong_bull_trap:
-            trap_reason = "Price swept buy-side liquidity/resistance and failed back below it."
+        signal_label = "NO TRADE · FRESH LIQUIDITY CONFLICT"
+        if unresolved_two_sided:
+            trap_reason = "Both sides were swept in the same active timeframe and direction has not yet resolved."
+        elif bull_trap_near:
+            trap_reason = "A fresh buy-side sweep conflicts with the attempted bullish move."
         else:
-            trap_reason = "Price swept sell-side liquidity/support and failed to hold the break."
+            trap_reason = "A fresh sell-side sweep conflicts with the attempted bearish move."
+    elif bullish_confirmation:
+        market_state = "BUY"
+        regime = "breakout_up" if breakout_up or trap_release_side == "BUY" else (
+            "volatile_bullish" if volatility_state in {"high", "extreme"} else "bullish_trend"
+        )
+        if trap_release_side == "BUY":
+            signal_label = "ENTER BUY · TRAP RESOLVED"
+        elif breakout_up:
+            signal_label = "ENTER BUY · BREAKOUT CONFIRMED"
+            bullish += 7
+        else:
+            signal_label = "ENTER BUY · TREND CONFIRMED"
+    elif bearish_confirmation:
+        market_state = "SELL"
+        regime = "breakout_down" if breakout_down or trap_release_side == "SELL" else (
+            "volatile_bearish" if volatility_state in {"high", "extreme"} else "bearish_trend"
+        )
+        if trap_release_side == "SELL":
+            signal_label = "ENTER SELL · TRAP RESOLVED"
+        elif breakout_down:
+            signal_label = "ENTER SELL · BREAKOUT CONFIRMED"
+            bearish += 7
+        else:
+            signal_label = "ENTER SELL · TREND CONFIRMED"
     elif stuck:
         market_state = "STUCK"
         regime = "stuck_range"
         signal_label = "NO TRADE · MARKET STUCK"
-        trap_reason = "ADX is weak and choppiness/compression indicate a range."
-    elif breakout_up and net >= -4:
+        trap_reason = "Trend strength is weak and price is compressed or balanced."
+    elif breakout_up and net >= 4:
         market_state = "BUY"
         regime = "breakout_up"
-        signal_label = "ENTER BUY · BREAKOUT"
-        bullish += 7
-    elif breakout_down and net <= 4:
+        signal_label = "ENTER BUY · EARLY BREAKOUT"
+        bullish += 5
+    elif breakout_down and net <= -4:
         market_state = "SELL"
         regime = "breakout_down"
-        signal_label = "ENTER SELL · BREAKOUT"
-        bearish += 7
-    elif net >= 0:
+        signal_label = "ENTER SELL · EARLY BREAKOUT"
+        bearish += 5
+    elif net >= 8:
         market_state = "BUY"
         regime = "volatile_bullish" if volatility_state in {"high", "extreme"} else "bullish_trend"
-        signal_label = "ENTER BUY · VOLATILE TREND" if "volatile" in regime else "ENTER BUY · TREND"
-    else:
+        signal_label = "ENTER BUY · DIRECTIONAL BIAS"
+    elif net <= -8:
         market_state = "SELL"
         regime = "volatile_bearish" if volatility_state in {"high", "extreme"} else "bearish_trend"
-        signal_label = "ENTER SELL · VOLATILE TREND" if "volatile" in regime else "ENTER SELL · TREND"
+        signal_label = "ENTER SELL · DIRECTIONAL BIAS"
+    else:
+        market_state = "STUCK"
+        regime = "stuck_range"
+        signal_label = "NO TRADE · INSUFFICIENT EDGE"
+        trap_reason = "Directional evidence is too balanced to justify a trade."
 
     # Macro is an execution gate, not a decorative score. When enabled and
     # required, incomplete or conflicting macro data cannot produce a high-
@@ -507,9 +702,9 @@ def build_technical_report(
             signal_label = "NO TRADE · MACRO DATA INCOMPLETE"
         elif macro.gate == "CONFLICT":
             trap_reason = f"Technical {market_state} conflicts with DXY/US10Y/gold-flow confirmation."
-            market_state = "TRAP"
-            regime = "liquidity_trap"
-            signal_label = "NO TRADE · TECHNICAL/MACRO CONFLICT"
+            market_state = "STUCK"
+            regime = "stuck_range"
+            signal_label = "NO TRADE · MACRO CONFLICT"
         elif macro.gate == "NEUTRAL" and macro_required_for_entry:
             if abs(net) < 38 or average_adx < 27 or not technical_alignment:
                 trap_reason = "DXY and yield are mixed; technical strength is not exceptional enough to justify execution."

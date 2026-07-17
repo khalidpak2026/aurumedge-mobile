@@ -406,6 +406,151 @@ def _gold_change(frame: pd.DataFrame, hours: int) -> float | None:
     return _change_near_hours(work, hours)
 
 
+def _compose_macro_confirmation(
+    dxy: MacroAssetSnapshot,
+    us10y: MacroAssetSnapshot,
+    gold_h1: pd.DataFrame,
+    technical_decision: str,
+    notes: list[str] | None = None,
+    *,
+    dxy_daily: bool = False,
+    yield_daily: bool = False,
+) -> MacroConfirmation:
+    """Combine cached macro assets with the latest gold H1 flow and decision.
+
+    DXY and US10Y are slow-moving context feeds and can be cached for several
+    minutes. Gold's 1h/4h flow and the execution gate are recalculated on every
+    market refresh, so a 90-second candle sync does not trigger slow external
+    macro HTTP requests.
+    """
+    notes = list(notes or [])
+    gold_change_1h = _gold_change(gold_h1, 1)
+    gold_change_4h = _gold_change(gold_h1, 4)
+    gold_direction = "UNAVAILABLE"
+    if gold_change_4h is not None:
+        recent = gold_h1["close"].astype(float)
+        scale = max(float(recent.tail(24).std(ddof=0) or 0), float(recent.iloc[-1]) * 0.00015, 0.25)
+        gold_direction = "UP" if gold_change_4h > scale * 0.25 else "DOWN" if gold_change_4h < -scale * 0.25 else "FLAT"
+
+    dxy_points = 40 if dxy.direction != "UNAVAILABLE" and not dxy_daily else 30 if dxy.direction != "UNAVAILABLE" else 0
+    yield_points = 40 if us10y.direction != "UNAVAILABLE" and not yield_daily else 30 if us10y.direction != "UNAVAILABLE" else 0
+    gold_points = 20 if gold_change_4h is not None else 0
+    available = dxy_points + yield_points + gold_points
+    data_status = "COMPLETE" if available >= 90 else "PARTIAL" if available >= 60 else "INSUFFICIENT"
+
+    score = 50
+    reasons: list[str] = []
+    conflicts: list[str] = []
+    if dxy.direction == "DOWN":
+        score += 20
+        reasons.append("DXY is down, removing a major headwind from dollar-priced gold.")
+    elif dxy.direction == "UP":
+        score -= 20
+        conflicts.append("DXY is up, creating a major headwind for gold.")
+    if us10y.direction == "DOWN":
+        score += 20
+        reasons.append("The U.S. 10-year yield is down, reducing opportunity-cost pressure on gold.")
+    elif us10y.direction == "UP":
+        score -= 20
+        conflicts.append("The U.S. 10-year yield is up, increasing opportunity-cost pressure on gold.")
+    if gold_direction == "UP":
+        score += 8
+        reasons.append("Gold's own four-hour move is positive, confirming current upside flow.")
+    elif gold_direction == "DOWN":
+        score -= 8
+        conflicts.append("Gold's own four-hour move is negative, confirming current downside flow.")
+    score = int(max(0, min(100, score)))
+
+    if data_status == "INSUFFICIENT":
+        bias = "UNAVAILABLE"
+    elif dxy.direction == "DOWN" and us10y.direction == "DOWN":
+        bias = "BULLISH_GOLD"
+    elif dxy.direction == "UP" and us10y.direction == "UP":
+        bias = "BEARISH_GOLD"
+    elif score >= 64:
+        bias = "BULLISH_GOLD"
+    elif score <= 36:
+        bias = "BEARISH_GOLD"
+    else:
+        bias = "MIXED"
+
+    bullish_pair = dxy.direction == "DOWN" and us10y.direction == "DOWN"
+    bearish_pair = dxy.direction == "UP" and us10y.direction == "UP"
+    if data_status == "INSUFFICIENT":
+        gate = "UNAVAILABLE"
+    elif technical_decision == "BUY":
+        if bearish_pair or (gold_direction == "DOWN" and bias != "BULLISH_GOLD"):
+            gate = "CONFLICT"
+        elif bullish_pair and gold_direction == "UP":
+            gate = "CONFIRM"
+        elif bias == "BULLISH_GOLD" and gold_direction == "UP" and available >= 80:
+            gate = "CONFIRM"
+        else:
+            gate = "NEUTRAL"
+    elif technical_decision == "SELL":
+        if bullish_pair or (gold_direction == "UP" and bias != "BEARISH_GOLD"):
+            gate = "CONFLICT"
+        elif bearish_pair and gold_direction == "DOWN":
+            gate = "CONFIRM"
+        elif bias == "BEARISH_GOLD" and gold_direction == "DOWN" and available >= 80:
+            gate = "CONFIRM"
+        else:
+            gate = "NEUTRAL"
+    else:
+        gate = "NEUTRAL"
+
+    if gate == "CONFIRM":
+        reasons.append(f"DXY/yield/gold-flow conditions confirm the technical {technical_decision} direction.")
+    elif gate == "CONFLICT":
+        conflicts.append(f"DXY/yield/gold-flow conditions conflict with the technical {technical_decision} direction.")
+    elif gate == "UNAVAILABLE":
+        conflicts.append("Macro coverage is insufficient for a high-conviction entry decision.")
+
+    if dxy.direction == us10y.direction and dxy.direction in {"UP", "DOWN"}:
+        alignment = f"DXY and US10Y both {dxy.direction}"
+    elif dxy.direction == "UNAVAILABLE" or us10y.direction == "UNAVAILABLE":
+        alignment = "Macro pair incomplete"
+    else:
+        alignment = "DXY and US10Y mixed"
+
+    return MacroConfirmation(
+        dxy=dxy.model_copy(deep=True),
+        us10y=us10y.model_copy(deep=True),
+        gold_change_1h=round(gold_change_1h, 4) if gold_change_1h is not None else None,
+        gold_change_4h=round(gold_change_4h, 4) if gold_change_4h is not None else None,
+        gold_direction=gold_direction,  # type: ignore[arg-type]
+        macro_bias=bias,  # type: ignore[arg-type]
+        confirmation_score=score,
+        coverage_score=available,
+        data_status=data_status,  # type: ignore[arg-type]
+        alignment=alignment,
+        gate=gate,  # type: ignore[arg-type]
+        reasons=reasons,
+        conflicts=conflicts,
+        news_risk="UNAVAILABLE",
+        notes=notes,
+    )
+
+
+def refresh_macro_confirmation(
+    cached: MacroConfirmation,
+    gold_h1: pd.DataFrame,
+    technical_decision: str,
+) -> MacroConfirmation:
+    """Refresh gold flow and gate while reusing cached DXY/US10Y snapshots."""
+    dxy_daily = any(token in cached.dxy.source.upper() for token in ("DAILY", "FRED", "ECB"))
+    yield_daily = any(token in cached.us10y.source.upper() for token in ("DAILY", "FRED", "TREASURY"))
+    return _compose_macro_confirmation(
+        cached.dxy,
+        cached.us10y,
+        gold_h1,
+        technical_decision,
+        cached.notes,
+        dxy_daily=dxy_daily,
+        yield_daily=yield_daily,
+    )
+
+
 def fetch_macro_confirmation(
     api_key: str,
     dxy_symbol: str,
@@ -486,116 +631,12 @@ def fetch_macro_confirmation(
     dxy = _snapshot(dxy_series, False, daily_series=dxy_daily)
     us10y = _snapshot(yield_series, True, daily_series=yield_daily)
 
-    gold_change_1h = _gold_change(gold_h1, 1)
-    gold_change_4h = _gold_change(gold_h1, 4)
-    gold_direction = "UNAVAILABLE"
-    if gold_change_4h is not None:
-        recent = gold_h1["close"].astype(float)
-        scale = max(float(recent.tail(24).std(ddof=0) or 0), float(recent.iloc[-1]) * 0.00015, 0.25)
-        gold_direction = "UP" if gold_change_4h > scale * 0.25 else "DOWN" if gold_change_4h < -scale * 0.25 else "FLAT"
-
-    # Intraday macro inputs earn full weight. Official/daily fallbacks still
-    # permit a decision but are intentionally capped, so confidence cannot look
-    # identical to a fully live macro feed.
-    dxy_points = 40 if dxy.direction != "UNAVAILABLE" and not dxy_daily else 30 if dxy.direction != "UNAVAILABLE" else 0
-    yield_points = 40 if us10y.direction != "UNAVAILABLE" and not yield_daily else 30 if us10y.direction != "UNAVAILABLE" else 0
-    gold_points = 20 if gold_change_4h is not None else 0
-    available = dxy_points + yield_points + gold_points
-    data_status = "COMPLETE" if available >= 90 else "PARTIAL" if available >= 60 else "INSUFFICIENT"
-
-    score = 50
-    reasons: list[str] = []
-    conflicts: list[str] = []
-    if dxy.direction == "DOWN":
-        score += 20
-        reasons.append("DXY is down, removing a major headwind from dollar-priced gold.")
-    elif dxy.direction == "UP":
-        score -= 20
-        conflicts.append("DXY is up, creating a major headwind for gold.")
-    if us10y.direction == "DOWN":
-        score += 20
-        reasons.append("The U.S. 10-year yield is down, reducing opportunity-cost pressure on gold.")
-    elif us10y.direction == "UP":
-        score -= 20
-        conflicts.append("The U.S. 10-year yield is up, increasing opportunity-cost pressure on gold.")
-    if gold_direction == "UP":
-        score += 8
-        reasons.append("Gold's own four-hour move is positive, confirming current upside flow.")
-    elif gold_direction == "DOWN":
-        score -= 8
-        conflicts.append("Gold's own four-hour move is negative, confirming current downside flow.")
-    score = int(max(0, min(100, score)))
-
-    if data_status == "INSUFFICIENT":
-        bias = "UNAVAILABLE"
-    elif dxy.direction == "DOWN" and us10y.direction == "DOWN":
-        bias = "BULLISH_GOLD"
-    elif dxy.direction == "UP" and us10y.direction == "UP":
-        bias = "BEARISH_GOLD"
-    elif score >= 64:
-        bias = "BULLISH_GOLD"
-    elif score <= 36:
-        bias = "BEARISH_GOLD"
-    else:
-        bias = "MIXED"
-
-    # Strict execution gate: DXY/yield context and gold's own four-hour flow
-    # must point in the same direction before the macro layer returns CONFIRM.
-    # This prevents an apparently supportive dollar/yield pair from confirming
-    # a trade while gold itself is already moving the other way.
-    bullish_pair = dxy.direction == "DOWN" and us10y.direction == "DOWN"
-    bearish_pair = dxy.direction == "UP" and us10y.direction == "UP"
-    if data_status == "INSUFFICIENT":
-        gate = "UNAVAILABLE"
-    elif technical_decision == "BUY":
-        if bearish_pair or (gold_direction == "DOWN" and bias != "BULLISH_GOLD"):
-            gate = "CONFLICT"
-        elif bullish_pair and gold_direction == "UP":
-            gate = "CONFIRM"
-        elif bias == "BULLISH_GOLD" and gold_direction == "UP" and available >= 80:
-            gate = "CONFIRM"
-        else:
-            gate = "NEUTRAL"
-    elif technical_decision == "SELL":
-        if bullish_pair or (gold_direction == "UP" and bias != "BEARISH_GOLD"):
-            gate = "CONFLICT"
-        elif bearish_pair and gold_direction == "DOWN":
-            gate = "CONFIRM"
-        elif bias == "BEARISH_GOLD" and gold_direction == "DOWN" and available >= 80:
-            gate = "CONFIRM"
-        else:
-            gate = "NEUTRAL"
-    else:
-        gate = "NEUTRAL"
-
-    if gate == "CONFIRM":
-        reasons.append(f"DXY/yield/gold-flow conditions confirm the technical {technical_decision} direction.")
-    elif gate == "CONFLICT":
-        conflicts.append(f"DXY/yield/gold-flow conditions conflict with the technical {technical_decision} direction.")
-    elif gate == "UNAVAILABLE":
-        conflicts.append("Macro coverage is insufficient for a high-conviction entry decision.")
-
-    if dxy.direction == us10y.direction and dxy.direction in {"UP", "DOWN"}:
-        alignment = f"DXY and US10Y both {dxy.direction}"
-    elif dxy.direction == "UNAVAILABLE" or us10y.direction == "UNAVAILABLE":
-        alignment = "Macro pair incomplete"
-    else:
-        alignment = "DXY and US10Y mixed"
-
-    return MacroConfirmation(
-        dxy=dxy,
-        us10y=us10y,
-        gold_change_1h=round(gold_change_1h, 4) if gold_change_1h is not None else None,
-        gold_change_4h=round(gold_change_4h, 4) if gold_change_4h is not None else None,
-        gold_direction=gold_direction,  # type: ignore[arg-type]
-        macro_bias=bias,  # type: ignore[arg-type]
-        confirmation_score=score,
-        coverage_score=available,
-        data_status=data_status,  # type: ignore[arg-type]
-        alignment=alignment,
-        gate=gate,  # type: ignore[arg-type]
-        reasons=reasons,
-        conflicts=conflicts,
-        news_risk="UNAVAILABLE",
-        notes=notes,
+    return _compose_macro_confirmation(
+        dxy,
+        us10y,
+        gold_h1,
+        technical_decision,
+        notes,
+        dxy_daily=dxy_daily,
+        yield_daily=yield_daily,
     )

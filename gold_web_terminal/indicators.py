@@ -181,6 +181,16 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     out["donchian_low"] = out["low"].shift(1).rolling(20).min()
     out["breakout_up"] = out["close"] > out["donchian_high"]
     out["breakout_down"] = out["close"] < out["donchian_low"]
+    # Faster structure and impulse fields allow the state machine to recognise
+    # a real move before slow H1 EMA alignment fully catches up.
+    out["structure_high_8"] = out["high"].shift(1).rolling(8).max()
+    out["structure_low_8"] = out["low"].shift(1).rolling(8).min()
+    out["structure_break_up"] = out["close"] > out["structure_high_8"]
+    out["structure_break_down"] = out["close"] < out["structure_low_8"]
+    out["impulse_1_atr"] = (out["close"] - out["close"].shift(1)) / out["atr14"].replace(0, np.nan)
+    out["impulse_3_atr"] = (out["close"] - out["close"].shift(3)) / out["atr14"].replace(0, np.nan)
+    candle_range_for_location = (out["high"] - out["low"]).replace(0, np.nan)
+    out["close_location"] = ((out["close"] - out["low"]) / candle_range_for_location).clip(0, 1)
     out["ema20_slope_atr"] = (out["ema20"] - out["ema20"].shift(5)) / out["atr14"].replace(0, np.nan)
     out["ema50_slope_atr"] = (out["ema50"] - out["ema50"].shift(8)) / out["atr14"].replace(0, np.nan)
     width_floor = out["bb_width_pct"].rolling(100, min_periods=40).quantile(0.25)
@@ -291,4 +301,9 @@ def summarize_indicators(df: pd.DataFrame, timeframe: str) -> IndicatorSnapshot:
         trend=trend,
         momentum=momentum,
         directional_score=round(direction_score, 2),
+        impulse_1_atr=_safe_float(row.get("impulse_1_atr")),
+        impulse_3_atr=_safe_float(row.get("impulse_3_atr")),
+        close_location=_safe_float(row.get("close_location")),
+        structure_break_up=bool(row.get("structure_break_up", False)),
+        structure_break_down=bool(row.get("structure_break_down", False)),
     )
