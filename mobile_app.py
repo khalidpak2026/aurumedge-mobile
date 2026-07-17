@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import math
 import os
+import time
 from html import escape
 from pathlib import Path
 from typing import Any
@@ -17,7 +19,7 @@ from gold_web_terminal.config import Settings
 from gold_web_terminal.demo_data import generate_demo_bars
 from gold_web_terminal.indicators import add_indicators, summarize_indicators
 from gold_web_terminal.liquidity import analyze_liquidity
-from gold_web_terminal.macro_data import decode_gold_h1_json, fetch_macro_confirmation
+from gold_web_terminal.macro_data import fetch_macro_confirmation, refresh_macro_confirmation
 from gold_web_terminal.market_data import MarketBundle, TwelveDataClient
 from gold_web_terminal.mobile_svg import mobile_macd_html, mobile_market_map_html, mobile_regime_html
 from gold_web_terminal.models import (
@@ -41,7 +43,7 @@ try:
 except Exception:
     pass
 
-BUILD_VERSION = "5.3.0-mobile-adaptive-macro"
+BUILD_VERSION = "5.4.0-mobile-all-timeframe-sync"
 TIMEFRAMES = ["M5", "M15", "H1", "H4", "D1"]
 TV_INTERVALS = {"M5": "5", "M15": "15", "H1": "60", "H4": "240", "D1": "D"}
 
@@ -75,7 +77,7 @@ button[kind="secondary"]{color:#e5edf7!important;background:#101c2f!important;bo
 .stTabs [data-baseweb="tab-list"]{gap:4px;overflow-x:auto;scrollbar-width:none;border-bottom:1px solid var(--line);position:sticky;top:0;z-index:10;background:rgba(6,10,18,.95);backdrop-filter:blur(14px)}.stTabs [data-baseweb="tab"]{height:45px;min-width:max-content;padding:0 11px;color:#93a1b5;font-size:.67rem;font-weight:800}.stTabs [aria-selected="true"]{color:var(--gold)!important}.stTabs [data-baseweb="tab-highlight"]{background:var(--gold)!important}
 .tf-grid{display:grid;grid-template-columns:repeat(5,minmax(92px,1fr));gap:7px;overflow-x:auto;padding-bottom:4px}.tf-card{border:1px solid var(--line);border-radius:12px;padding:9px;background:#091321;min-width:92px}.tf-card .tf-head{display:flex;justify-content:space-between;gap:4px;font-size:.59rem;font-weight:800}.tf-card .tf-score{font-family:'Manrope';font-size:1rem;font-weight:800;margin-top:6px}.tf-card .tf-sub{font-size:.55rem;color:#73849a;margin-top:3px;line-height:1.35}
 .ae-ladder{border:1px solid var(--line);border-radius:13px;overflow:hidden}.ae-ladder-row{display:grid;grid-template-columns:1.35fr .8fr .52fr;gap:7px;align-items:center;padding:9px 10px;border-bottom:1px solid var(--line);background:#091321}.ae-ladder-row:last-child{border-bottom:0}.ae-ladder-name{font-size:.65rem;color:#aab6c8}.ae-ladder-price{font-family:'Manrope';font-size:.72rem;font-weight:800;text-align:right}.ae-ladder-side{font-size:.52rem;font-weight:800;text-align:right}.ae-ladder-side.res{color:var(--red)}.ae-ladder-side.sup{color:var(--green)}.ae-ladder-side.neutral{color:var(--gold)}
-[data-testid="stDataFrame"]{border:1px solid var(--line);border-radius:12px;overflow:hidden}.stMetric{border:1px solid var(--line);border-radius:12px;padding:9px 10px;background:#0a1322}.stMetric label{font-size:.64rem!important}.stMetric [data-testid="stMetricValue"]{font-size:1rem!important}.svg-chart-shell{width:100%;overflow:hidden;border:1px solid var(--line);border-radius:16px;background:#07101d;box-shadow:0 12px 34px rgba(0,0,0,.22)}.mobile-market-svg,.mobile-mini-svg{display:block;width:100%;height:auto;min-height:250px}.svg-chart-error{padding:18px;border-radius:14px;background:rgba(255,93,125,.10);border:1px solid rgba(255,93,125,.25);color:#ff8da3;font-weight:700}.mobile-footer{text-align:center;color:#65758b;font-size:.59rem;margin:18px 0 4px}
+[data-testid="stDataFrame"]{border:1px solid var(--line);border-radius:12px;overflow:hidden}.stMetric{border:1px solid var(--line);border-radius:12px;padding:9px 10px;background:#0a1322}.stMetric label{font-size:.64rem!important}.stMetric [data-testid="stMetricValue"]{font-size:1rem!important}.svg-chart-shell{width:100%;overflow:hidden;border:1px solid var(--line);border-radius:16px;background:#07101d;box-shadow:0 12px 34px rgba(0,0,0,.22)}.mobile-market-svg,.mobile-mini-svg{display:block;width:100%;height:auto;min-height:250px}.svg-chart-error{padding:18px;border-radius:14px;background:rgba(255,93,125,.10);border:1px solid rgba(255,93,125,.25);color:#ff8da3;font-weight:700}.sync-row{display:grid;grid-template-columns:1fr 1fr;gap:8px;align-items:center}.sync-badge{min-height:42px;border:1px solid var(--line);border-radius:12px;background:#091321;display:flex;align-items:center;justify-content:center;color:#c6d1df;font-size:.66rem;font-weight:800;letter-spacing:.04em}.sync-badge strong{color:var(--gold);margin-left:5px}.mobile-footer{text-align:center;color:#65758b;font-size:.59rem;margin:18px 0 4px}
 @media(max-width:430px){.block-container{padding-left:.5rem!important;padding-right:.5rem!important}.mobile-title{font-size:.9rem}.mobile-sub{display:none}.mobile-live{font-size:.56rem;padding:6px 7px}.mkpi,.macro-card,.risk-card,.brain-card{padding:10px}.stTabs [data-baseweb="tab"]{padding:0 9px}.signal-title{font-size:1.3rem}}
 </style>
 """
@@ -102,21 +104,41 @@ def macro_tone(direction: str, gold_asset: bool = False) -> str:
     return "tone-good" if favorable else "tone-bad" if adverse else "tone-warn"
 
 
-@st.cache_data(ttl=90, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
 def fetch_live_bundle(api_key: str, symbol: str, bars: int) -> MarketBundle:
+    # One synchronization loads every supported timeframe. M15 is derived from
+    # M5, while H4 and D1 are derived from H1 inside the market-data client.
     return TwelveDataClient(api_key).fetch_bundle(symbol, TIMEFRAMES, bars)
 
 
-@st.cache_data(ttl=600, show_spinner=False)
-def cached_macro(
-    api_key: str,
-    dxy_symbol: str,
-    us10y_symbol: str,
-    gold_h1_json: str,
-    technical_decision: str,
-) -> MacroConfirmation:
-    gold_h1 = decode_gold_h1_json(gold_h1_json)
-    return fetch_macro_confirmation(api_key, dxy_symbol, us10y_symbol, gold_h1, technical_decision)
+def clear_full_market_cache(reason: str) -> None:
+    fetch_live_bundle.clear()
+    st.session_state.pop("all_timeframe_analysis", None)
+    st.session_state["market_refresh_epoch"] = time.time()
+    st.session_state["last_refresh_reason"] = reason
+
+
+def bundle_signature(bundle: MarketBundle) -> str:
+    rows: list[tuple[str, int, str, float]] = []
+    for timeframe in TIMEFRAMES:
+        frame = bundle.frames[timeframe]
+        last = frame.iloc[-1]
+        rows.append((timeframe, len(frame), pd.to_datetime(last["time"], utc=True).isoformat(), round(float(last["close"]), 6)))
+    return json.dumps([bundle.source, bundle.symbol, bundle.data_time, rows], separators=(",", ":"))
+
+
+@st.fragment(run_every=1)
+def auto_refresh_controller(enabled: bool, live_feed: bool, interval_seconds: int) -> None:
+    if not enabled or not live_feed:
+        st.markdown('<div class="sync-badge">AUTO SYNC PAUSED</div>', unsafe_allow_html=True)
+        return
+    now = time.time()
+    started = float(st.session_state.get("market_refresh_epoch", now))
+    remaining = max(0, int(math.ceil(interval_seconds - (now - started))))
+    st.markdown(f'<div class="sync-badge">ALL TF <strong>{remaining}s</strong></div>', unsafe_allow_html=True)
+    if remaining <= 0:
+        clear_full_market_cache(f"Automatic {interval_seconds}-second all-timeframe synchronization")
+        st.rerun()
 
 
 @st.cache_data(ttl=1200, show_spinner=False)
@@ -258,13 +280,29 @@ st.markdown(
 )
 
 with st.container(border=True):
-    c1, c2 = st.columns([1.3, .7], vertical_alignment="bottom")
+    chart_tf = st.selectbox(
+        "Chart timeframe",
+        TIMEFRAMES,
+        index=2,
+        help="This changes only the chart. The decision always compares M5, M15, H1, H4 and D1 together.",
+    )
+    c1, c2 = st.columns([1, 1], vertical_alignment="center")
     with c1:
-        chart_tf = st.selectbox("Analysis timeframe", TIMEFRAMES, index=2)
+        auto_enabled = st.toggle(
+            "90-second auto sync",
+            value=settings.auto_refresh_enabled,
+            key="mobile_auto_refresh_enabled",
+            help="Refreshes all timeframes together. Switching charts uses the stored synchronized snapshot.",
+        )
     with c2:
-        if st.button("REFRESH", use_container_width=True):
-            fetch_live_bundle.clear()
-            st.rerun()
+        previous_auto = st.session_state.get("_mobile_previous_auto")
+        if previous_auto is None or previous_auto != auto_enabled:
+            st.session_state["market_refresh_epoch"] = time.time()
+        st.session_state["_mobile_previous_auto"] = auto_enabled
+        auto_refresh_controller(auto_enabled, feed_live, settings.auto_refresh_seconds)
+    if st.button("↻ SYNC ALL TIMEFRAMES", use_container_width=True):
+        clear_full_market_cache("Manual all-timeframe synchronization")
+        st.rerun()
 
 with st.expander("CFD risk profile", expanded=False):
     rc1, rc2 = st.columns(2)
@@ -313,9 +351,23 @@ if load_warning:
     st.warning(load_warning)
 
 try:
-    frames = {tf: add_indicators(df) for tf, df in bundle.frames.items()}
-    indicator_snapshots = [summarize_indicators(frames[tf], tf) for tf in TIMEFRAMES]
-    liquidity_snapshots = [analyze_liquidity(frames[tf], tf) for tf in ["M15", "H1", "H4", "D1"]]
+    signature = bundle_signature(bundle)
+    analysis_cache = st.session_state.get("all_timeframe_analysis")
+    if isinstance(analysis_cache, dict) and analysis_cache.get("signature") == signature:
+        frames = analysis_cache["frames"]
+        indicator_snapshots = analysis_cache["indicator_snapshots"]
+        liquidity_snapshots = analysis_cache["liquidity_snapshots"]
+    else:
+        with st.spinner("Calculating M5, M15, H1, H4 and D1 together…"):
+            frames = {tf: add_indicators(bundle.frames[tf]) for tf in TIMEFRAMES}
+            indicator_snapshots = [summarize_indicators(frames[tf], tf) for tf in TIMEFRAMES]
+            liquidity_snapshots = [analyze_liquidity(frames[tf], tf) for tf in ["M15", "H1", "H4", "D1"]]
+        st.session_state["all_timeframe_analysis"] = {
+            "signature": signature,
+            "frames": frames,
+            "indicator_snapshots": indicator_snapshots,
+            "liquidity_snapshots": liquidity_snapshots,
+        }
 except Exception as exc:
     st.error(f"Technical calculation failed: {exc}")
     st.stop()
@@ -333,6 +385,11 @@ adaptive = AdaptiveEngine(
 completed_reviews = adaptive.review_pending(frames)
 adaptive_summary = adaptive.summary()
 
+decision_memory = st.session_state.setdefault(
+    "decision_memory",
+    {"state": None, "trap_anchor_price": None, "trap_age": 0},
+)
+
 preliminary_report = build_technical_report(
     symbol=bundle.symbol,
     data_time=bundle.data_time,
@@ -349,27 +406,37 @@ preliminary_report = build_technical_report(
 )
 
 if settings.macro_enabled and bundle.source != "DEMO":
+    gold_h1 = frames["H1"][["time", "close"]].copy()
+    now_epoch = time.time()
+    macro_cache = st.session_state.get("macro_asset_cache")
+    force_macro = bool(st.session_state.pop("force_macro_refresh", False))
+    macro_age = (now_epoch - float(macro_cache.get("epoch", 0))) if isinstance(macro_cache, dict) else float("inf")
+    macro_due = force_macro or not isinstance(macro_cache, dict) or macro_age >= settings.macro_cache_minutes * 60
     try:
-        with st.spinner("Checking DXY, US10Y and Gold 4H flow…"):
-            macro = cached_macro(
-                settings.twelve_data_api_key,
-                settings.dxy_symbol,
-                settings.us10y_symbol,
-                frames["H1"][["time", "close"]].to_json(orient="split", date_format="iso"),
-                preliminary_report.market_state,
-            )
-        if macro.coverage_score >= 60:
-            st.session_state["last_good_macro"] = macro
-        elif isinstance(st.session_state.get("last_good_macro"), MacroConfirmation):
-            macro = st.session_state["last_good_macro"].model_copy(deep=True)
-            macro.notes.append("Current macro refresh was incomplete; last successful macro snapshot is shown as STALE.")
+        if macro_due:
+            with st.spinner("Refreshing DXY and U.S. 10-year yield context…"):
+                macro = fetch_macro_confirmation(
+                    settings.twelve_data_api_key,
+                    settings.dxy_symbol,
+                    settings.us10y_symbol,
+                    gold_h1,
+                    preliminary_report.market_state,
+                )
+            if macro.coverage_score >= 60:
+                st.session_state["macro_asset_cache"] = {"epoch": now_epoch, "macro": macro}
+                st.session_state["last_good_macro"] = macro
+        else:
+            macro = refresh_macro_confirmation(macro_cache["macro"], gold_h1, preliminary_report.market_state)
+        if macro.coverage_score < 60 and isinstance(st.session_state.get("last_good_macro"), MacroConfirmation):
+            macro = refresh_macro_confirmation(st.session_state["last_good_macro"], gold_h1, preliminary_report.market_state)
+            macro.notes.append("Current external macro refresh was incomplete; cached DXY/US10Y are STALE while Gold 4H flow is current.")
             macro.dxy.freshness = (macro.dxy.freshness + " · STALE").strip(" ·")
             macro.us10y.freshness = (macro.us10y.freshness + " · STALE").strip(" ·")
     except Exception as exc:
         previous = st.session_state.get("last_good_macro")
         if isinstance(previous, MacroConfirmation):
-            macro = previous.model_copy(deep=True)
-            macro.notes.append(f"Macro refresh failed; last successful snapshot is shown as STALE ({exc.__class__.__name__}).")
+            macro = refresh_macro_confirmation(previous, gold_h1, preliminary_report.market_state)
+            macro.notes.append(f"External macro refresh failed; cached DXY/US10Y remain STALE while Gold 4H flow was recalculated ({exc.__class__.__name__}).")
             macro.dxy.freshness = (macro.dxy.freshness + " · STALE").strip(" ·")
             macro.us10y.freshness = (macro.us10y.freshness + " · STALE").strip(" ·")
         else:
@@ -392,7 +459,21 @@ report = build_technical_report(
     risk_inputs=risk_inputs,
     macro=macro,
     macro_required_for_entry=settings.macro_required_for_entry,
+    previous_state=decision_memory.get("state"),
+    trap_anchor_price=decision_memory.get("trap_anchor_price"),
+    trap_age=int(decision_memory.get("trap_age", 0)),
 )
+
+if report.market_state == "TRAP":
+    if decision_memory.get("state") != "TRAP" or decision_memory.get("trap_anchor_price") is None:
+        decision_memory["trap_anchor_price"] = report.last_price
+        decision_memory["trap_age"] = 1
+    else:
+        decision_memory["trap_age"] = int(decision_memory.get("trap_age", 0)) + 1
+else:
+    decision_memory["trap_anchor_price"] = None
+    decision_memory["trap_age"] = 0
+decision_memory["state"] = report.market_state
 
 feature_votes = derive_feature_votes(indicator_snapshots, liquidity_snapshots, macro, report.market_state)
 if report.market_state in {"BUY", "SELL"} and report.active_setup is not None:
@@ -401,7 +482,7 @@ if report.market_state in {"BUY", "SELL"} and report.active_setup is not None:
 # Optional paid AI research remains manual. The adaptive technical/macro engine
 # owns prices, entries, stops and targets.
 final_state = report.market_state
-final_note = "Adaptive technical + DXY/US10Y gate"
+final_note = "All-timeframe M5→D1 + adaptive + DXY/US10Y gate"
 ai_review: AIAnalysis | None = st.session_state.get("mobile_ai_review")
 if ai_review is not None:
     if report.market_state in {"STUCK", "TRAP"}:
@@ -441,7 +522,8 @@ tabs = st.tabs(["SIGNAL", "MACRO", "CHART", "LEVELS", "MOMENTUM", "BRAIN", "MORE
 signal_tab, macro_tab, chart_tab, levels_tab, momentum_tab, brain_tab, more_tab = tabs
 
 with signal_tab:
-    st.markdown('<div class="mobile-section">Multi-timeframe alignment</div>', unsafe_allow_html=True)
+    st.markdown('<div class="mobile-section">Multi-timeframe decision stack</div>', unsafe_allow_html=True)
+    st.markdown('<div class="mobile-callout">The final decision compares D1 regime, H4 trend, H1 structure, M15 confirmation and M5 timing. The selected chart does not change the decision.</div>', unsafe_allow_html=True)
     st.markdown(timeframe_cards(indicator_snapshots), unsafe_allow_html=True)
     st.markdown('<div class="mobile-section">Why this decision</div>', unsafe_allow_html=True)
     reasons: list[str] = []
@@ -485,8 +567,8 @@ with signal_tab:
     st.code(summary, language=None)
 
 with macro_tab:
-    if st.button("REFRESH MACRO", use_container_width=True, help="Refreshes the cached DXY and yield sources."):
-        cached_macro.clear()
+    if st.button("REFRESH MACRO", use_container_width=True, help="Forces a fresh DXY and yield lookup. Gold 4H is refreshed every 90-second sync."):
+        st.session_state["force_macro_refresh"] = True
         st.rerun()
     st.markdown(macro_cards(macro), unsafe_allow_html=True)
     st.markdown('<div class="mobile-section">Confirmations</div>', unsafe_allow_html=True)
@@ -627,6 +709,10 @@ with more_tab:
             "data_time": report.data_time,
             "symbol": report.symbol,
             "build": BUILD_VERSION,
+            "auto_refresh_enabled": auto_enabled,
+            "auto_refresh_seconds": settings.auto_refresh_seconds,
+            "all_timeframes_compared": TIMEFRAMES,
+            "last_refresh_reason": st.session_state.get("last_refresh_reason", "Initial synchronization"),
             "macro_gate": macro.gate,
             "macro_coverage": macro.coverage_score,
             "dxy_source": macro.dxy.source,
@@ -639,4 +725,4 @@ with more_tab:
             "order_execution": False,
         })
 
-st.markdown(f'<div class="mobile-footer">AurumEdge Adaptive Mobile · {BUILD_VERSION} · No broker connection · No automatic execution</div>', unsafe_allow_html=True)
+st.markdown(f'<div class="mobile-footer">AurumEdge Adaptive Mobile · {BUILD_VERSION} · All-timeframe sync · No broker connection · No automatic execution</div>', unsafe_allow_html=True)

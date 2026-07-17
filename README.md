@@ -1,64 +1,77 @@
-# AurumEdge Adaptive Mobile v5.3
+# AurumEdge Adaptive Mobile v5.4
 
-A mobile-first Streamlit XAU/USD decision terminal using the same adaptive, macro-confirmed and risk-controlled engine as AurumEdge Adaptive Windows v7.3.
+A mobile-first Streamlit XAU/USD decision terminal using the same all-timeframe, adaptive, macro-confirmed and risk-controlled engine as AurumEdge Adaptive Windows v7.5.
 
-## Included on the iPhone main page
+## All-timeframe decision process
 
-- XAU/USD price and final BUY / SELL / TRAP / STUCK state
-- DXY value, direction, change, source and freshness
-- U.S. 10-year yield value, direction, change, source and freshness
-- Gold four-hour flow calculated from live H1 candles
-- Macro alignment, data coverage and final decision gate
-- Adaptive indicator weights and completed-signal reviews
-- Structural entry, SL and adaptive TP1–TP3
-- Requested-lot loss, recommended lot and risk-budget status
-- Safari-safe SVG chart with EMA, VWAP, Supertrend, volume and liquidity levels
+The selected timeframe changes only the chart shown on screen. The final market decision always compares all five timeframes:
 
-## Decision gate
+- **D1:** dominant regime and large support/resistance
+- **H4:** major trend and supply/demand
+- **H1:** active directional structure
+- **M15:** breakout, pullback, liquidity and momentum confirmation
+- **M5:** entry timing
 
-A directional entry is normally allowed only when macro coverage is sufficient and the macro gate is not conflicting.
+A noisy M5 or M15 move cannot independently reverse the H1/H4/D1 conclusion. Lower-timeframe opposition is labelled as a pullback or mixed market unless structure confirms a real reversal.
 
-- Technical BUY + DXY down + US10Y down + Gold 4H up: confirmation
-- Technical SELL + DXY up + US10Y up + Gold 4H down: confirmation
-- Technical/macro conflict: TRAP
-- Incomplete macro coverage: STUCK
-- Excessive requested-lot risk: reduce lot or no trade
+## 90-second synchronization
 
-## Existing Streamlit Secrets
+- Auto-sync is enabled by default every 90 seconds.
+- One synchronization updates all timeframes together.
+- M5 and H1 are downloaded from the market-data provider.
+- M15 is derived locally from M5.
+- H4 and D1 are derived locally from H1.
+- Indicator and liquidity calculations for all timeframes are stored in memory.
+- Switching the visible chart between M5, M15, H1, H4 and D1 is therefore much faster and does not spend an additional API request.
+- A visible countdown and manual **SYNC ALL TIMEFRAMES** button are included.
 
-Your current `TWELVE_DATA_API_KEY`, market symbol and TradingView symbol continue to work. No new key is required.
+## Market-state corrections
 
-Optional values may be added later:
+The corrected state machine distinguishes:
+
+- BUY trend or confirmed bullish reversal
+- SELL trend or confirmed bearish continuation
+- Pullback against the higher-timeframe trend
+- STUCK/mixed range
+- A short-lived unresolved liquidity TRAP
+
+TRAP expires after the relevant candles or immediately when price displacement and structure confirm a direction. Macro conflict produces STUCK rather than keeping the terminal trapped indefinitely.
+
+## Macro confirmation
+
+The main page shows:
+
+- DXY value and direction
+- U.S. 10-year yield value and direction
+- Gold four-hour flow calculated from current H1 candles
+- Macro alignment, data coverage and decision gate
+
+DXY and US10Y are cached for about 10 minutes. Gold four-hour flow and the final gate are recalculated every 90-second gold sync.
+
+## Adaptive brain and realistic risk
+
+- Completed signals are evaluated after their outcome window.
+- Indicator reliability changes are bounded and require evidence.
+- Target distances adapt gradually to historical favourable movement.
+- Stops remain beyond real structure and ATR noise.
+- If the requested lot risks too much, the app recommends a smaller lot or blocks the trade instead of placing an unrealistically close stop.
+
+## Streamlit Secrets
+
+Your existing `TWELVE_DATA_API_KEY` and other Secrets remain valid. Optional controls:
 
 ```toml
-MACRO_ENABLED = "true"
-MACRO_REQUIRED_FOR_ENTRY = "true"
+AUTO_REFRESH_ENABLED = "true"
+AUTO_REFRESH_SECONDS = "90"
 MACRO_CACHE_MINUTES = "10"
-
-ACCOUNT_BALANCE = "10000"
-RISK_PERCENT = "1.0"
-REQUESTED_LOT = "0.10"
-XAU_CONTRACT_SIZE = "100"
-SPREAD_PRICE = "0.50"
-SLIPPAGE_PRICE = "0.20"
-
-ADAPTIVE_LEARNING = "true"
-ADAPTIVE_MIN_SAMPLES = "20"
-ADAPTIVE_HORIZON_BARS = "12"
-ADAPTIVE_MAX_WEIGHT_CHANGE = "0.05"
 ```
 
-The app already uses these defaults when the values are absent.
+OpenAI research remains optional and off by default.
 
 ## Adaptive-state persistence
 
-Streamlit Community Cloud storage can reset when an app is redeployed or rebuilt. The **BRAIN** tab includes:
-
-- Download brain backup
-- Restore adaptive-state JSON
-
-Download a backup periodically after the engine has accumulated useful completed-signal evidence.
+Streamlit Cloud storage may reset after redeployment. Use the **BRAIN** tab to download and restore `adaptive_state.json`.
 
 ## Safety
 
-This application is analysis-only. It is not connected to a broker and cannot execute orders. Verify the broker's GOLD contract size, spread and current quote before using the risk estimate.
+This is an analysis-only application. It is not connected to a broker and cannot execute orders. No classifier can guarantee profitable trades. Verify the broker quote, spread and GOLD contract size before using any level or position-size estimate.

@@ -1,18 +1,20 @@
-# Update the existing iPhone Streamlit app
+# Update the existing AurumEdge iPhone app to v5.4
 
 Repository: `khalidpak2026/aurumedge-mobile`
 
-## 1. Back up the current adaptive state
+This update adds the same all-timeframe synchronization and corrected market-state engine as Windows v7.5.
 
-The previous mobile version did not have the full adaptive brain, so there may be nothing to preserve. For later updates, use the BRAIN tab and download `adaptive_state.json` first.
+## Before uploading
 
-## 2. Replace repository-root files
+Open the current mobile app, go to **BRAIN**, and download `adaptive_state.json` if it has accumulated useful trade reviews. Streamlit Cloud storage may reset during deployment.
 
-At the GitHub repository home page choose:
+## 1. Upload repository-root files
+
+On the GitHub repository home page choose:
 
 `Add file` → `Upload files`
 
-Upload these files from the extracted v5.3 package:
+Upload these files from the extracted v5.4 folder:
 
 - `mobile_app.py`
 - `requirements.txt`
@@ -21,9 +23,9 @@ Upload these files from the extracted v5.3 package:
 - `README.md`
 - `GITHUB_UPDATE_GUIDE.md`
 
-Do not upload `.env`, `.venv`, `__pycache__`, or `.pyc` files.
+You may also upload `.streamlit/config.toml`. Do not upload a real `.env`, `secrets.toml`, `.venv`, `__pycache__`, or `.pyc` file.
 
-## 3. Replace the Python package files in the correct folder
+## 2. Replace the Python package inside the correct folder
 
 Open the existing GitHub folder:
 
@@ -33,62 +35,76 @@ Choose:
 
 `Add file` → `Upload files`
 
-Upload every `.py` file from the extracted package's own `gold_web_terminal` folder. Confirm that GitHub shows files such as:
+Upload every `.py` file from the update package's own `gold_web_terminal` folder. These files must remain inside `gold_web_terminal`, especially:
 
-- `gold_web_terminal/adaptive_engine.py`
-- `gold_web_terminal/macro_data.py`
-- `gold_web_terminal/risk_engine.py`
-- `gold_web_terminal/mobile_svg.py`
 - `gold_web_terminal/strategy.py`
+- `gold_web_terminal/indicators.py`
+- `gold_web_terminal/liquidity.py`
 - `gold_web_terminal/models.py`
+- `gold_web_terminal/macro_data.py`
+- `gold_web_terminal/market_data.py`
+- `gold_web_terminal/config.py`
+- `gold_web_terminal/mobile_svg.py`
+- `gold_web_terminal/adaptive_engine.py`
+- `gold_web_terminal/risk_engine.py`
 
-These files must be inside `gold_web_terminal`, not at the repository root.
+## 3. Preserve or initialize adaptive state
 
-## 4. Upload the initial adaptive data folder
-
-At the repository root upload the `data` folder containing:
+At the repository root, keep:
 
 `data/adaptive_state.json`
 
-This is the initial state. Future accumulated learning should be backed up from the mobile app before a redeployment.
+To preserve your learned state, upload the backup downloaded from the BRAIN tab instead of replacing it with the blank initial file.
 
-## 5. Commit
+## 4. Commit
 
-Use the commit message:
+Use this commit message:
 
-`Add adaptive macro and risk engine to mobile app`
+`Add 90-second all-timeframe mobile sync`
 
 Streamlit should redeploy automatically.
 
-## 6. Reboot only if needed
+## 5. Secrets
+
+Your existing Streamlit Secrets continue to work. No API key needs to be entered again.
+
+Optional settings:
+
+```toml
+AUTO_REFRESH_ENABLED = "true"
+AUTO_REFRESH_SECONDS = "90"
+MACRO_CACHE_MINUTES = "10"
+```
+
+Gold M5 and H1 candles refresh every 90 seconds. M15, H4 and D1 are rebuilt locally. DXY and US10Y remain cached for about 10 minutes, while Gold 4H flow is recalculated on every cycle.
+
+## 6. Confirm the deployment
+
+The header must display:
+
+`5.4.0-mobile-all-timeframe-sync`
+
+The control area must include:
+
+- Chart timeframe selector
+- 90-second auto-sync switch
+- Countdown showing `ALL TF · ...s`
+- `SYNC ALL TIMEFRAMES` button
+
+The SIGNAL tab must say that the final decision compares:
+
+- D1 regime
+- H4 trend
+- H1 structure
+- M15 confirmation
+- M5 timing
+
+Changing the visible chart timeframe must not make a new provider request or change the decision by itself.
+
+## 7. If Streamlit does not update
 
 In Streamlit Community Cloud:
 
 `My apps` → app menu → `Reboot app`
 
-Then open the existing app URL. Streamlit Secrets do not need to be re-entered.
-
-## 7. Confirm the update
-
-The header must show:
-
-`5.3.0-mobile-adaptive-macro`
-
-The main page must show:
-
-- DXY
-- US 10Y yield
-- Gold 4H flow
-- Data coverage
-- Decision gate
-- CFD risk profile
-
-The tabs must include:
-
-- SIGNAL
-- MACRO
-- CHART
-- LEVELS
-- MOMENTUM
-- BRAIN
-- MORE
+Then reopen the existing iPhone app URL and refresh Safari once.
