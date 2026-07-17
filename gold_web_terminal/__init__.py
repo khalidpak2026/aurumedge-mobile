@@ -1,1 +1,1 @@
-__version__ = "2.0.0-web-only"
+__version__ = "7.0.0-adaptive-risk-macro"

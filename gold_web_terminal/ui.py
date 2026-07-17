@@ -288,11 +288,17 @@ def signal_panel_html(
 <div class="ae-note">A trade is intentionally blocked while ADX, choppiness and compression show poor directional follow-through. Refresh after a clean range break.</div>
 """
     else:
-        title = f"ENTER {final_state}"
-        copy = f"{report.regime.replace('_',' ').title()} · active market zone · valid until {escape(setup.valid_until if setup else '—')}"
+        risk_blocked = bool(setup is not None and setup.status == "NO_TRADE")
+        title = f"{final_state} BIAS · RISK GATE" if risk_blocked else f"ENTER {final_state}"
+        copy = f"{report.regime.replace('_',' ').title()} · {'direction valid but position risk blocked' if risk_blocked else 'active market zone'} · valid until {escape(setup.valid_until if setup else '—')}"
         if setup is None:
             plan = '<div class="ae-note">No active setup was generated.</div>'
         else:
+            risk_html = ""
+            if setup.risk_plan is not None:
+                rp = setup.risk_plan
+                risk_color = "var(--green)" if rp.status == "OK" else "var(--amber)" if rp.status == "REDUCE_LOT" else "var(--red)"
+                risk_html = f"""<div class="ae-note" style="border-color:{risk_color}"><strong style="color:{risk_color}">RISK GATE · {escape(rp.status)}</strong><br>Requested lot {rp.requested_lot:.2f} · recommended {rp.recommended_lot:.2f} · estimated requested-lot loss ${rp.estimated_loss_requested_lot:,.2f} · budget ${rp.risk_budget:,.2f}<br>{escape(rp.message)}</div>"""
             plan = f"""
 <div class="ae-level-grid">
   <div class="ae-level wide entry"><div class="ae-level-label">Entry zone</div><div class="ae-level-value">{_fmt(setup.entry_low)} – {_fmt(setup.entry_high)}</div></div>
@@ -301,7 +307,8 @@ def signal_panel_html(
   <div class="ae-level target"><div class="ae-level-label">Take profit 2 · {setup.risk_reward_2}R</div><div class="ae-level-value">{_fmt(setup.take_profit_2)}</div></div>
   <div class="ae-level target"><div class="ae-level-label">Take profit 3 · {setup.risk_reward_3}R</div><div class="ae-level-value">{_fmt(setup.take_profit_3)}</div></div>
 </div>
-<div class="ae-note">{escape(setup.invalidation)}</div>
+<div class="ae-note">{escape(setup.invalidation)}<br>{escape(setup.stop_basis)}<br>{escape(setup.target_basis)}</div>
+{risk_html}
 """
 
     buy_width = max(2, min(100, report.buy_score))
@@ -381,6 +388,61 @@ def timeframe_cards_html(snapshots: list[IndicatorSnapshot]) -> str:
         )
     return '<div style="display:grid;grid-template-columns:repeat(5,minmax(110px,1fr));gap:8px">' + "".join(cards) + "</div>"
 
+
+
+def macro_confirmation_html(report: TechnicalReport) -> str:
+    macro = report.macro
+    if macro is None:
+        return '<div class="ae-note">Macro confirmation is unavailable. Directional execution is blocked while the macro gate is required.</div>'
+
+    def arrow(direction: str) -> str:
+        return {"UP": "↑", "DOWN": "↓", "FLAT": "→"}.get(direction, "—")
+
+    def tone(direction: str, gold_positive: bool = False) -> str:
+        if direction == "UNAVAILABLE":
+            return "#8e9bb0"
+        favorable = direction == ("UP" if gold_positive else "DOWN")
+        adverse = direction == ("DOWN" if gold_positive else "UP")
+        return "var(--green)" if favorable else "var(--red)" if adverse else "var(--amber)"
+
+    dxy_value = _fmt(macro.dxy.value, 3)
+    y_value = _fmt(macro.us10y.value, 3)
+    gold_move = _fmt(macro.gold_change_4h, 2)
+    dxy_change = macro.dxy.change_4h if macro.dxy.change_4h is not None else macro.dxy.change_1d
+    dxy_period = "4h" if macro.dxy.change_4h is not None else "1d"
+    yield_change = macro.us10y.change_4h if macro.us10y.change_4h is not None else macro.us10y.change_1d
+    yield_period = "4h" if macro.us10y.change_4h is not None else "1d"
+    gate_color = "var(--green)" if macro.gate == "CONFIRM" else "var(--red)" if macro.gate == "CONFLICT" else "var(--amber)"
+    coverage_color = "var(--green)" if macro.coverage_score >= 100 else "var(--amber)" if macro.coverage_score >= 80 else "var(--red)"
+    return f"""
+<div class="ae-kpi-grid" style="grid-template-columns:repeat(6,1fr)">
+  <div class="ae-kpi"><div class="ae-kpi-label">DXY</div><div class="ae-kpi-value" style="color:{tone(macro.dxy.direction)}">{dxy_value} {arrow(macro.dxy.direction)}</div><div class="ae-kpi-sub">{dxy_period} {dxy_change if dxy_change is not None else '—'} · {escape(macro.dxy.source)}</div><div class="ae-kpi-sub">{escape(macro.dxy.freshness)}</div></div>
+  <div class="ae-kpi"><div class="ae-kpi-label">US 10Y YIELD</div><div class="ae-kpi-value" style="color:{tone(macro.us10y.direction)}">{y_value}% {arrow(macro.us10y.direction)}</div><div class="ae-kpi-sub">{yield_period} {yield_change if yield_change is not None else '—'} · {escape(macro.us10y.source)}</div><div class="ae-kpi-sub">{escape(macro.us10y.freshness)}</div></div>
+  <div class="ae-kpi"><div class="ae-kpi-label">GOLD 4H FLOW</div><div class="ae-kpi-value" style="color:{tone(macro.gold_direction, True)}">{gold_move} {arrow(macro.gold_direction)}</div><div class="ae-kpi-sub">Calculated from live H1 candles</div></div>
+  <div class="ae-kpi"><div class="ae-kpi-label">MACRO ALIGNMENT</div><div class="ae-kpi-value">{escape(macro.alignment)}</div><div class="ae-kpi-sub">Bias {escape(macro.macro_bias.replace('_', ' '))} · score {macro.confirmation_score}/100</div></div>
+  <div class="ae-kpi"><div class="ae-kpi-label">DATA COVERAGE</div><div class="ae-kpi-value" style="color:{coverage_color}">{macro.coverage_score}%</div><div class="ae-kpi-sub">{escape(macro.data_status)} · DXY + yield + gold flow</div></div>
+  <div class="ae-kpi"><div class="ae-kpi-label">DECISION GATE</div><div class="ae-kpi-value" style="color:{gate_color}">{escape(macro.gate)}</div><div class="ae-kpi-sub">Directional entry requires complete confirmation</div></div>
+</div>
+"""
+
+
+def adaptive_learning_html(report: TechnicalReport) -> str:
+    adaptive = report.adaptive
+    if adaptive is None:
+        return '<div class="ae-note">Adaptive-learning state is unavailable.</div>'
+    weights = sorted(adaptive.indicator_weights.items(), key=lambda item: item[1], reverse=True)
+    chips = ''.join(f'<span class="ae-chip">{escape(name.replace("_"," ").upper())} {value:.2f}× · n={adaptive.indicator_samples.get(name,0)}</span>' for name, value in weights)
+    targets = adaptive.target_r_multipliers
+    return f"""
+<div class="ae-kpi-grid" style="grid-template-columns:repeat(4,1fr)">
+  <div class="ae-kpi"><div class="ae-kpi-label">Reviewed signals</div><div class="ae-kpi-value">{adaptive.reviewed_signals}</div><div class="ae-kpi-sub">Completed evidence only</div></div>
+  <div class="ae-kpi"><div class="ae-kpi-label">Win rate</div><div class="ae-kpi-value">{adaptive.win_rate:.1f}%</div><div class="ae-kpi-sub">{adaptive.wins} wins · {adaptive.losses} losses · {adaptive.timeouts} timeouts</div></div>
+  <div class="ae-kpi"><div class="ae-kpi-label">Adaptive targets</div><div class="ae-kpi-value">{targets['tp1']:.2f}R / {targets['tp2']:.2f}R / {targets['tp3']:.2f}R</div><div class="ae-kpi-sub">Based on historical MFE after enough samples</div></div>
+  <div class="ae-kpi"><div class="ae-kpi-label">Learning mode</div><div class="ae-kpi-value">{'ACTIVE' if adaptive.enabled else 'OFF'}</div><div class="ae-kpi-sub">Bounded and evidence-weighted</div></div>
+</div>
+<div class="ae-note"><strong>Latest review</strong><br>{escape(adaptive.last_review)}</div>
+<div class="ae-chip-wrap" style="margin-top:10px">{chips}</div>
+"""
 
 def footer_html(build: str) -> str:
     return f"""

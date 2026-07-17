@@ -78,6 +78,54 @@ class LiquiditySnapshot(BaseModel):
     value_area_low: float | None = None
 
 
+class MacroAssetSnapshot(BaseModel):
+    symbol: str
+    label: str
+    value: float | None = None
+    change_1h: float | None = None
+    change_4h: float | None = None
+    change_1d: float | None = None
+    change_pct_1d: float | None = None
+    direction: Literal["UP", "DOWN", "FLAT", "UNAVAILABLE"] = "UNAVAILABLE"
+    source: str = ""
+    data_time: str = ""
+    freshness: str = ""
+
+
+class MacroConfirmation(BaseModel):
+    dxy: MacroAssetSnapshot
+    us10y: MacroAssetSnapshot
+    gold_change_1h: float | None = None
+    gold_change_4h: float | None = None
+    gold_direction: Literal["UP", "DOWN", "FLAT", "UNAVAILABLE"] = "UNAVAILABLE"
+    macro_bias: Literal["BULLISH_GOLD", "BEARISH_GOLD", "MIXED", "UNAVAILABLE"] = "UNAVAILABLE"
+    confirmation_score: int = Field(default=50, ge=0, le=100)
+    coverage_score: int = Field(default=0, ge=0, le=100)
+    data_status: Literal["COMPLETE", "PARTIAL", "INSUFFICIENT"] = "INSUFFICIENT"
+    alignment: str = "Macro pair unavailable"
+    gate: Literal["CONFIRM", "NEUTRAL", "CONFLICT", "UNAVAILABLE"] = "UNAVAILABLE"
+    reasons: list[str] = Field(default_factory=list)
+    conflicts: list[str] = Field(default_factory=list)
+    news_risk: Literal["LOW", "MEDIUM", "HIGH", "EXTREME", "UNAVAILABLE"] = "UNAVAILABLE"
+    notes: list[str] = Field(default_factory=list)
+
+
+class PositionRiskPlan(BaseModel):
+    account_balance: float
+    risk_percent: float
+    risk_budget: float
+    requested_lot: float
+    recommended_lot: float
+    maximum_safe_lot: float
+    contract_size: float
+    lot_step: float
+    stop_distance: float
+    estimated_loss_requested_lot: float
+    estimated_loss_recommended_lot: float
+    status: Literal["OK", "REDUCE_LOT", "NO_TRADE"]
+    message: str
+
+
 class TradeSetup(BaseModel):
     side: Literal["BUY", "SELL"]
     status: Literal["ENTER", "NO_TRADE"]
@@ -94,8 +142,26 @@ class TradeSetup(BaseModel):
     risk_reward_3: float
     valid_until: str
     invalidation: str
+    stop_basis: str = ""
+    target_basis: str = ""
+    management_plan: list[str] = Field(default_factory=list)
+    risk_plan: PositionRiskPlan | None = None
     rationale: list[str] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
+
+
+class AdaptiveLearningSummary(BaseModel):
+    enabled: bool = True
+    reviewed_signals: int = 0
+    wins: int = 0
+    losses: int = 0
+    timeouts: int = 0
+    win_rate: float = 0.0
+    indicator_weights: dict[str, float] = Field(default_factory=dict)
+    indicator_samples: dict[str, int] = Field(default_factory=dict)
+    target_r_multipliers: dict[str, float] = Field(default_factory=lambda: {"tp1": 0.8, "tp2": 1.3, "tp3": 1.8})
+    last_review: str = "No completed signals have been reviewed yet."
+    safeguards: list[str] = Field(default_factory=list)
 
 
 class TechnicalReport(BaseModel):
@@ -127,6 +193,8 @@ class TechnicalReport(BaseModel):
     active_setup: TradeSetup | None = None
     buy_setup: TradeSetup
     sell_setup: TradeSetup
+    macro: MacroConfirmation | None = None
+    adaptive: AdaptiveLearningSummary | None = None
     data_quality_notes: list[str] = Field(default_factory=list)
 
 

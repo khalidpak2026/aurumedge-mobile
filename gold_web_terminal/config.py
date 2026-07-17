@@ -10,6 +10,20 @@ def _as_bool(value: str, default: bool = True) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _as_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _as_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
 @dataclass(slots=True)
 class Settings:
     openai_api_key: str
@@ -23,17 +37,65 @@ class Settings:
     auto_research: bool
     research_cache_minutes: int
 
+    # Practical CFD risk model. These are defaults; the Windows UI can override them.
+    account_balance: float
+    requested_lot: float
+    contract_size: float
+    lot_step: float
+    min_lot: float
+    maximum_risk_dollars: float
+    spread_price: float
+    slippage_price: float
+    minimum_stop_atr: float
+    maximum_stop_atr: float
+    target_profile: str
+
+    # Controlled adaptive-learning state.
+    adaptive_learning: bool
+    adaptive_state_path: str
+    adaptive_min_samples: int
+    adaptive_horizon_bars: int
+    adaptive_max_weight_change: float
+
+    # Macro confirmation inputs.
+    macro_enabled: bool
+    macro_required_for_entry: bool
+    dxy_symbol: str
+    us10y_symbol: str
+    macro_cache_minutes: int
+
     @classmethod
     def from_env(cls) -> "Settings":
         return cls(
             openai_api_key=os.getenv("OPENAI_API_KEY", ""),
-            openai_model=os.getenv("OPENAI_MODEL", "gpt-5.6-luna"),
+            openai_model=os.getenv("OPENAI_MODEL", "gpt-5.5"),
             twelve_data_api_key=os.getenv("TWELVE_DATA_API_KEY", ""),
             market_symbol=os.getenv("MARKET_SYMBOL", "XAU/USD"),
             tradingview_symbol=os.getenv("TRADINGVIEW_SYMBOL", "OANDA:XAUUSD"),
-            bars_per_timeframe=max(250, int(os.getenv("BARS_PER_TIMEFRAME", "500"))),
-            risk_percent=float(os.getenv("RISK_PERCENT", "1.0")),
+            bars_per_timeframe=max(250, _as_int("BARS_PER_TIMEFRAME", 500)),
+            risk_percent=max(0.05, _as_float("RISK_PERCENT", 1.0)),
             journal_path=os.getenv("JOURNAL_PATH", "data/trade_journal.csv"),
-            auto_research=_as_bool(os.getenv("AUTO_RESEARCH", "true"), True),
-            research_cache_minutes=max(5, int(os.getenv("RESEARCH_CACHE_MINUTES", "20"))),
+            auto_research=_as_bool(os.getenv("AUTO_RESEARCH", "false"), False),
+            research_cache_minutes=max(5, _as_int("RESEARCH_CACHE_MINUTES", 20)),
+            account_balance=max(1.0, _as_float("ACCOUNT_BALANCE", 10000.0)),
+            requested_lot=max(0.0, _as_float("REQUESTED_LOT", 0.10)),
+            contract_size=max(0.01, _as_float("XAU_CONTRACT_SIZE", 100.0)),
+            lot_step=max(0.001, _as_float("LOT_STEP", 0.01)),
+            min_lot=max(0.001, _as_float("MIN_LOT", 0.01)),
+            maximum_risk_dollars=max(0.0, _as_float("MAXIMUM_RISK_DOLLARS", 0.0)),
+            spread_price=max(0.0, _as_float("SPREAD_PRICE", 0.50)),
+            slippage_price=max(0.0, _as_float("SLIPPAGE_PRICE", 0.20)),
+            minimum_stop_atr=max(0.25, _as_float("MINIMUM_STOP_ATR", 0.55)),
+            maximum_stop_atr=max(0.65, _as_float("MAXIMUM_STOP_ATR", 1.55)),
+            target_profile=os.getenv("TARGET_PROFILE", "balanced").strip().lower(),
+            adaptive_learning=_as_bool(os.getenv("ADAPTIVE_LEARNING", "true"), True),
+            adaptive_state_path=os.getenv("ADAPTIVE_STATE_PATH", "data/adaptive_state.json"),
+            adaptive_min_samples=max(8, _as_int("ADAPTIVE_MIN_SAMPLES", 20)),
+            adaptive_horizon_bars=max(4, _as_int("ADAPTIVE_HORIZON_BARS", 12)),
+            adaptive_max_weight_change=max(0.01, min(0.20, _as_float("ADAPTIVE_MAX_WEIGHT_CHANGE", 0.05))),
+            macro_enabled=_as_bool(os.getenv("MACRO_ENABLED", "true"), True),
+            macro_required_for_entry=_as_bool(os.getenv("MACRO_REQUIRED_FOR_ENTRY", "true"), True),
+            dxy_symbol=os.getenv("DXY_SYMBOL", "DXY"),
+            us10y_symbol=os.getenv("US10Y_SYMBOL", "US10Y"),
+            macro_cache_minutes=max(2, _as_int("MACRO_CACHE_MINUTES", 5)),
         )
