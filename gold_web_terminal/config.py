@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import math
 from dataclasses import dataclass
 
 
@@ -22,6 +23,24 @@ def _as_int(name: str, default: int) -> int:
         return int(os.getenv(name, str(default)))
     except (TypeError, ValueError):
         return default
+
+
+def _free_plan_safe_interval(daily_limit: int, watcher_minutes: int) -> int:
+    """Return a conservative UI refresh interval when the 5-minute cloud watcher is active.
+
+    The candle loader uses two provider credits per synchronized cycle (M5 and
+    H1; M15/H4/D1 are derived locally). Ten percent of the daily allowance is
+    reserved for manual checks and retries.
+    """
+    limit = max(100, int(daily_limit))
+    watcher = max(5, int(watcher_minutes))
+    watcher_runs = math.ceil(1440 / watcher)
+    watcher_credits = watcher_runs * 2
+    reserve = max(40, int(limit * 0.10))
+    available_ui_credits = max(2, limit - watcher_credits - reserve)
+    ui_runs = max(1, available_ui_credits // 2)
+    seconds = math.ceil((86400 / ui_runs) / 60) * 60
+    return max(60, int(seconds))
 
 
 @dataclass(slots=True)
@@ -67,9 +86,26 @@ class Settings:
     # Automatic full-market synchronization.
     auto_refresh_enabled: bool
     auto_refresh_seconds: int
+    free_plan_mode: bool
+    provider_daily_limit: int
+    cloud_watcher_minutes: int
+
+    # Specialist strategy and optional alert delivery.
+    h4_fvg_strategy_enabled: bool
+    local_alerts_enabled: bool
+    alert_state_path: str
 
     @classmethod
     def from_env(cls) -> "Settings":
+        free_plan_mode = _as_bool(os.getenv("FREE_PLAN_MODE", "true"), True)
+        provider_daily_limit = max(100, _as_int("PROVIDER_DAILY_LIMIT", 800))
+        cloud_watcher_minutes = max(5, _as_int("CLOUD_WATCHER_MINUTES", 5))
+        requested_refresh = max(60, _as_int("AUTO_REFRESH_SECONDS", 1200))
+        if free_plan_mode:
+            requested_refresh = max(
+                requested_refresh,
+                _free_plan_safe_interval(provider_daily_limit, cloud_watcher_minutes),
+            )
         return cls(
             openai_api_key=os.getenv("OPENAI_API_KEY", ""),
             openai_model=os.getenv("OPENAI_MODEL", "gpt-5.5"),
@@ -103,5 +139,11 @@ class Settings:
             us10y_symbol=os.getenv("US10Y_SYMBOL", "US10Y"),
             macro_cache_minutes=max(2, _as_int("MACRO_CACHE_MINUTES", 10)),
             auto_refresh_enabled=_as_bool(os.getenv("AUTO_REFRESH_ENABLED", "true"), True),
-            auto_refresh_seconds=max(60, _as_int("AUTO_REFRESH_SECONDS", 90)),
+            auto_refresh_seconds=requested_refresh,
+            free_plan_mode=free_plan_mode,
+            provider_daily_limit=provider_daily_limit,
+            cloud_watcher_minutes=cloud_watcher_minutes,
+            h4_fvg_strategy_enabled=_as_bool(os.getenv("H4_FVG_STRATEGY_ENABLED", "true"), True),
+            local_alerts_enabled=_as_bool(os.getenv("LOCAL_ALERTS_ENABLED", "false"), False),
+            alert_state_path=os.getenv("ALERT_STATE_PATH", "data/alert_state.json"),
         )

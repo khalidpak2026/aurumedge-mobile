@@ -5,6 +5,7 @@ import math
 import numpy as np
 import pandas as pd
 
+from .market_context import add_market_context
 from .models import IndicatorSnapshot
 
 
@@ -195,6 +196,7 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     out["ema50_slope_atr"] = (out["ema50"] - out["ema50"].shift(8)) / out["atr14"].replace(0, np.nan)
     width_floor = out["bb_width_pct"].rolling(100, min_periods=40).quantile(0.25)
     out["compression"] = (out["bb_width_pct"] <= width_floor) & (out["adx14"] < 19)
+    out, _ = add_market_context(out)
     return out
 
 
@@ -211,31 +213,53 @@ def summarize_indicators(df: pd.DataFrame, timeframe: str) -> IndicatorSnapshot:
     adx_v = _safe_float(row.get("adx14"))
     ema20_slope = _safe_float(row.get("ema20_slope_atr"))
     ema50_slope = _safe_float(row.get("ema50_slope_atr"))
+    avwap_v = _safe_float(row.get("avwap_active"))
+    avwap_slope = _safe_float(row.get("avwap_slope_atr"))
+    structure_bias = str(row.get("structure_bias", "neutral"))
+    structure_state = str(row.get("structure_state", "RANGE"))
+    profile_state = str(row.get("profile_state", "UNAVAILABLE"))
+    profile_acceptance = str(row.get("profile_acceptance", "neutral"))
     super_dir_raw = int(row.get("supertrend_direction", 0)) if not pd.isna(row.get("supertrend_direction", np.nan)) else 0
 
-    trend = "neutral"
+    # Market structure and anchored VWAP are the primary trend layer. EMA is
+    # retained only as a lower-weight secondary confirmation/tie-breaker.
     trend_points = 0.0
+    if structure_bias == "bullish":
+        trend_points += 34
+    elif structure_bias == "bearish":
+        trend_points -= 34
+    if structure_state in {"BOS_UP", "CHOCH_UP"}:
+        trend_points += 18
+    elif structure_state in {"BOS_DOWN", "CHOCH_DOWN"}:
+        trend_points -= 18
+
+    if avwap_v is not None:
+        distance_atr = (close - avwap_v) / max(atr_v, 1e-9)
+        trend_points += max(-24, min(24, distance_atr * 15))
+    if avwap_slope is not None:
+        trend_points += max(-14, min(14, avwap_slope * 12))
+
+    if profile_acceptance == "bullish":
+        trend_points += 12
+    elif profile_acceptance == "bearish":
+        trend_points -= 12
+    elif profile_state == "ABOVE_VALUE":
+        trend_points += 7
+    elif profile_state == "BELOW_VALUE":
+        trend_points -= 7
+
+    # EMA remains visible and useful, but cannot override structure + AVWAP.
     if None not in (ema20_v, ema50_v, ema200_v):
         if close > ema20_v > ema50_v > ema200_v:
-            trend = "bullish"
-            trend_points += 45
+            trend_points += 10
         elif close < ema20_v < ema50_v < ema200_v:
-            trend = "bearish"
-            trend_points -= 45
-        elif close > ema50_v and ema20_v > ema50_v:
-            trend = "bullish"
-            trend_points += 28
-        elif close < ema50_v and ema20_v < ema50_v:
-            trend = "bearish"
-            trend_points -= 28
-    if ema20_slope is not None:
-        trend_points += max(-18, min(18, ema20_slope * 10))
-    if ema50_slope is not None:
-        trend_points += max(-12, min(12, ema50_slope * 7))
+            trend_points -= 10
     if super_dir_raw > 0:
-        trend_points += 12
+        trend_points += 7
     elif super_dir_raw < 0:
-        trend_points -= 12
+        trend_points -= 7
+
+    trend = "bullish" if trend_points >= 18 else "bearish" if trend_points <= -18 else "neutral"
 
     momentum = "neutral"
     momentum_points = 0.0
@@ -252,9 +276,9 @@ def summarize_indicators(df: pd.DataFrame, timeframe: str) -> IndicatorSnapshot:
     elif momentum_points <= -10:
         momentum = "bearish"
 
-    direction_score = trend_points * 0.62 + momentum_points * 0.38
+    direction_score = trend_points * 0.66 + momentum_points * 0.34
     if adx_v is not None:
-        direction_score *= min(1.18, max(0.72, adx_v / 24))
+        direction_score *= min(1.16, max(0.76, adx_v / 24))
     direction_score = max(-100, min(100, direction_score))
 
     timestamp = pd.to_datetime(row["time"], utc=True).isoformat()
@@ -285,6 +309,23 @@ def summarize_indicators(df: pd.DataFrame, timeframe: str) -> IndicatorSnapshot:
         bb_lower=_safe_float(row.get("bb_lower")),
         bb_width_pct=_safe_float(row.get("bb_width_pct")),
         vwap=_safe_float(row.get("vwap")),
+        avwap_active=avwap_v,
+        avwap_swing_low=_safe_float(row.get("avwap_swing_low")),
+        avwap_swing_high=_safe_float(row.get("avwap_swing_high")),
+        avwap_high_volume=_safe_float(row.get("avwap_high_volume")),
+        avwap_slope_atr=avwap_slope,
+        avwap_anchor=str(row.get("avwap_anchor", "highest_volume")),
+        profile_poc=_safe_float(row.get("profile_poc")),
+        profile_vah=_safe_float(row.get("profile_vah")),
+        profile_val=_safe_float(row.get("profile_val")),
+        profile_state=profile_state,
+        profile_acceptance=profile_acceptance if profile_acceptance in {"bullish", "bearish", "neutral"} else "neutral",
+        profile_hvn_above=_safe_float(row.get("profile_hvn_above")),
+        profile_hvn_below=_safe_float(row.get("profile_hvn_below")),
+        market_structure=structure_state,
+        structure_bias=structure_bias if structure_bias in {"bullish", "bearish", "neutral"} else "neutral",
+        last_swing_high=_safe_float(row.get("last_swing_high")),
+        last_swing_low=_safe_float(row.get("last_swing_low")),
         obv=_safe_float(row.get("obv")),
         obv_slope=_safe_float(row.get("obv_slope")),
         volume_zscore=_safe_float(row.get("volume_zscore")),

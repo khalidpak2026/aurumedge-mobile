@@ -7,6 +7,7 @@ from typing import Iterable
 import numpy as np
 import pandas as pd
 
+from .market_context import volume_profile
 from .models import IndicatorSnapshot, LiquiditySnapshot, TradeSetup
 
 BG = "#07101d"
@@ -70,6 +71,7 @@ def mobile_market_map_html(
     view = view.dropna(subset=["open", "high", "low", "close"]).reset_index(drop=True)
     if len(view) < 12:
         return '<div class="svg-chart-error">Not enough candles to draw the chart.</div>'
+    profile, profile_centers, profile_weights = volume_profile(view, lookback=len(view), bins=36)
 
     W, H = 1000, 700
     L, R = 58, 888
@@ -158,11 +160,12 @@ def mobile_market_map_html(
 
     # Indicator paths.
     path_specs = [
-        ("ema20", "EMA20", CYAN, 1.8, ""),
-        ("ema50", "EMA50", GOLD, 1.9, ""),
-        ("ema200", "EMA200", PURPLE, 2.0, ""),
-        ("vwap", "VWAP", WHITE, 1.3, 'stroke-dasharray="5 4"'),
-        ("supertrend", "SUPERTREND", GREEN, 1.3, 'stroke-dasharray="7 5"'),
+        ("avwap_active", "ANCHORED VWAP", GOLD, 2.7, ""),
+        ("avwap_high_volume", "HIGH-VOLUME AVWAP", WHITE, 1.5, 'stroke-dasharray="5 4"'),
+        ("vwap", "SESSION VWAP", CYAN, 1.2, 'stroke-dasharray="4 4"'),
+        ("ema50", "EMA50 SECONDARY", "#7dd3fc", 1.0, ""),
+        ("ema200", "EMA200 REGIME", PURPLE, 1.25, ""),
+        ("supertrend", "SUPERTREND", GREEN, 1.1, 'stroke-dasharray="7 5"'),
     ]
     for key, _, color, width, extra in path_specs:
         if key in view.columns:
@@ -182,6 +185,9 @@ def mobile_market_map_html(
             (liquidity.nearest_support, "SUPPORT", GREEN, "5 5"),
             (liquidity.nearest_resistance, "RESIST", RED, "5 5"),
         ])
+    structure_high = _finite(view.iloc[-1].get("last_swing_high"))
+    structure_low = _finite(view.iloc[-1].get("last_swing_low"))
+    levels.extend([(structure_high, "STRUCT H", RED, "6 4"), (structure_low, "STRUCT L", GREEN, "6 4")])
     if active_setup:
         levels.extend([
             (active_setup.stop_loss, "SL", RED, "7 4"),
@@ -206,27 +212,24 @@ def mobile_market_map_html(
     parts.append(f'<line x1="{L}" y1="{last_y:.1f}" x2="{R}" y2="{last_y:.1f}" stroke="{WHITE}" stroke-width="1" opacity=".60"/>')
     parts.append(_price_label(R + 104, last_y, "LAST", last, WHITE))
 
-    # Volume bars.
-    vol_col = "tick_volume" if "tick_volume" in view.columns else None
-    if vol_col:
-        vols = pd.to_numeric(view[vol_col], errors="coerce").fillna(0).to_numpy(float)
-        vmax = max(float(np.nanmax(vols)), 1.0)
-        for i, vol in enumerate(vols):
-            x = xs[i]
-            bar_h = (vol / vmax) * (VB - VT - 10)
-            color = GREEN if float(view.iloc[i]["close"]) >= float(view.iloc[i]["open"]) else RED
-            parts.append(f'<rect x="{x-candle_w/2:.1f}" y="{VB-bar_h:.1f}" width="{candle_w:.1f}" height="{bar_h:.1f}" fill="{color}" opacity=".48"/>')
-
-    # Date/time labels.
-    times = pd.to_datetime(view["time"], utc=True, errors="coerce")
-    for idx in np.linspace(0, n - 1, 5).astype(int):
-        if pd.isna(times.iloc[idx]):
-            continue
-        label = times.iloc[idx].strftime("%d %b\n%H:%M")
-        date, clock = label.split("\n")
-        x = xs[idx]
-        parts.append(f'<text x="{x:.1f}" y="{VB+22}" text-anchor="middle" fill="{MUTED}" font-size="9">{date}</text>')
-        parts.append(f'<text x="{x:.1f}" y="{VB+34}" text-anchor="middle" fill="{MUTED}" font-size="8">{clock}</text>')
+    # Volume-at-price profile replaces the old time-volume bars.
+    if len(profile_centers) and len(profile_weights):
+        pmin = float(min(profile_centers)); pmax = float(max(profile_centers))
+        vmax = max(float(max(profile_weights)), 1.0)
+        def px(value: float) -> float:
+            return L + (value - pmin) / max(pmax - pmin, 1e-9) * (R - L)
+        bar_w = max(2.0, (R-L) / max(len(profile_centers), 1) * .72)
+        for center, weight in zip(profile_centers, profile_weights):
+            x = px(float(center))
+            bar_h = float(weight) / vmax * (VB - VT - 16)
+            color = GOLD if profile.get("profile_poc") is not None and abs(float(center)-float(profile["profile_poc"])) <= (pmax-pmin)/max(len(profile_centers),1) else "#5d7899"
+            parts.append(f'<rect x="{x-bar_w/2:.1f}" y="{VB-bar_h:.1f}" width="{bar_w:.1f}" height="{bar_h:.1f}" fill="{color}" opacity=".72"/>')
+        for key, label, color in (("profile_poc","POC",GOLD),("profile_vah","VAH","#dcae46"),("profile_val","VAL","#dcae46")):
+            value = profile.get(key)
+            if value is None: continue
+            x = px(float(value))
+            parts.append(f'<line x1="{x:.1f}" y1="{VT}" x2="{x:.1f}" y2="{VB}" stroke="{color}" stroke-width="1.2" stroke-dasharray="4 3"/>')
+            parts.append(f'<text x="{x:.1f}" y="{VT+12}" text-anchor="middle" fill="{color}" font-size="8" font-weight="800">{label}</text>')
 
     # Title and legend.
     atr = _finite(view["atr14"].iloc[-1]) if "atr14" in view.columns else None
@@ -235,13 +238,13 @@ def mobile_market_map_html(
     stats = " · ".join(filter(None, [f"ATR {atr:.2f}" if atr else "", f"RSI {rsi:.1f}" if rsi else "", f"ADX {adx:.1f}" if adx else ""]))
     parts.append(f'<text x="{L}" y="28" fill="{TEXT}" font-size="17" font-weight="800">{_esc(symbol)} · {_esc(timeframe)}</text>')
     parts.append(f'<text x="{L}" y="45" fill="{MUTED}" font-size="10">{_esc(stats)}</text>')
-    legend = [(CYAN, "EMA20"), (GOLD, "EMA50"), (PURPLE, "EMA200"), (WHITE, "VWAP"), (GREEN, "Supertrend")]
+    legend = [(GOLD, "AVWAP"), (WHITE, "HV-AVWAP"), (CYAN, "VWAP"), (PURPLE, "EMA200"), (GREEN, "Structure") ]
     lx = 500
     for color, label in legend:
         parts.append(f'<line x1="{lx}" y1="31" x2="{lx+18}" y2="31" stroke="{color}" stroke-width="2"/>')
         parts.append(f'<text x="{lx+23}" y="35" fill="{MUTED}" font-size="9">{label}</text>')
         lx += 94
-    parts.append(f'<text x="{L}" y="{VT-8}" fill="{MUTED}" font-size="10" font-weight="700">VOLUME / ACTIVITY</text>')
+    parts.append(f'<text x="{L}" y="{VT-8}" fill="{MUTED}" font-size="10" font-weight="700">VOLUME PROFILE · PRICE DISTRIBUTION · {profile.get("profile_state","UNAVAILABLE")}</text>')
     parts.append('</svg></div>')
     return "".join(parts)
 

@@ -5,6 +5,7 @@ import math
 import numpy as np
 import pandas as pd
 
+from .market_context import volume_profile
 from .models import LiquiditySnapshot
 
 
@@ -89,32 +90,12 @@ def _fair_value_gaps(df: pd.DataFrame, limit: int = 8) -> tuple[list[dict], list
 
 
 def _volume_profile(df: pd.DataFrame, bins: int = 48) -> tuple[float | None, float | None, float | None]:
-    if df.empty:
-        return None, None, None
-    prices = ((df["high"] + df["low"] + df["close"]) / 3).to_numpy(dtype=float)
-    volume = df["tick_volume"].fillna(0).to_numpy(dtype=float)
-    low, high = float(np.nanmin(prices)), float(np.nanmax(prices))
-    if not math.isfinite(low) or not math.isfinite(high) or high <= low:
-        return None, None, None
-    edges = np.linspace(low, high, bins + 1)
-    weighted, _ = np.histogram(prices, bins=edges, weights=volume)
-    centers = (edges[:-1] + edges[1:]) / 2
-    if weighted.sum() <= 0:
-        return None, None, None
-    poc_index = int(np.argmax(weighted))
-    poc = float(centers[poc_index])
-    order = np.argsort(weighted)[::-1]
-    target = weighted.sum() * 0.70
-    selected: list[int] = []
-    running = 0.0
-    for index in order:
-        selected.append(int(index))
-        running += float(weighted[index])
-        if running >= target:
-            break
-    val = float(edges[min(selected)])
-    vah = float(edges[max(selected) + 1])
-    return poc, vah, val
+    profile, _, _ = volume_profile(df, lookback=min(220, len(df)), bins=bins)
+    return (
+        _finite(profile.get("profile_poc")),
+        _finite(profile.get("profile_vah")),
+        _finite(profile.get("profile_val")),
+    )
 
 
 def analyze_liquidity(df: pd.DataFrame, timeframe: str) -> LiquiditySnapshot:

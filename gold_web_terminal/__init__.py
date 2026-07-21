@@ -1,1 +1,1 @@
-__version__ = "7.0.0-adaptive-risk-macro"
+__version__ = "5.6.0-mobile-h4-fvg-alerts"

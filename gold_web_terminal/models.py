@@ -36,6 +36,23 @@ class IndicatorSnapshot(BaseModel):
     bb_lower: float | None = None
     bb_width_pct: float | None = None
     vwap: float | None = None
+    avwap_active: float | None = None
+    avwap_swing_low: float | None = None
+    avwap_swing_high: float | None = None
+    avwap_high_volume: float | None = None
+    avwap_slope_atr: float | None = None
+    avwap_anchor: str = "highest_volume"
+    profile_poc: float | None = None
+    profile_vah: float | None = None
+    profile_val: float | None = None
+    profile_state: str = "UNAVAILABLE"
+    profile_acceptance: Direction = "neutral"
+    profile_hvn_above: float | None = None
+    profile_hvn_below: float | None = None
+    market_structure: str = "RANGE"
+    structure_bias: Direction = "neutral"
+    last_swing_high: float | None = None
+    last_swing_low: float | None = None
     obv: float | None = None
     obv_slope: float | None = None
     volume_zscore: float | None = None
@@ -157,6 +174,38 @@ class TradeSetup(BaseModel):
     warnings: list[str] = Field(default_factory=list)
 
 
+class FourHourFVGSignal(BaseModel):
+    strategy_id: str = "H4_FVG_CONTINUATION"
+    strategy_name: str = "4H Candle + M15 FVG Continuation"
+    side: Literal["BUY", "SELL", "NONE"] = "NONE"
+    state: Literal["NONE", "WATCH", "ARMED", "TRIGGERED", "INVALIDATED", "EXPIRED"] = "NONE"
+    signal_id: str = ""
+    signal_time: str = ""
+    parent_candle_time: str = ""
+    parent_open: float | None = None
+    parent_high: float | None = None
+    parent_low: float | None = None
+    parent_close: float | None = None
+    parent_body_atr: float | None = None
+    fvg_created_time: str = ""
+    fvg_low: float | None = None
+    fvg_high: float | None = None
+    fvg_mid: float | None = None
+    entry_low: float | None = None
+    entry_high: float | None = None
+    stop_loss: float | None = None
+    take_profit_1: float | None = None
+    take_profit_2: float | None = None
+    take_profit_3: float | None = None
+    confidence: int = Field(default=0, ge=0, le=100)
+    aligns_with_primary: bool = False
+    macro_gate: str = "UNAVAILABLE"
+    valid_until: str = ""
+    rationale: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+    risk_plan: PositionRiskPlan | None = None
+
+
 class AdaptiveLearningSummary(BaseModel):
     enabled: bool = True
     reviewed_signals: int = 0
@@ -202,6 +251,7 @@ class TechnicalReport(BaseModel):
     sell_setup: TradeSetup
     macro: MacroConfirmation | None = None
     adaptive: AdaptiveLearningSummary | None = None
+    special_signals: list[FourHourFVGSignal] = Field(default_factory=list)
     data_quality_notes: list[str] = Field(default_factory=list)
 
 

@@ -26,6 +26,9 @@ DEFAULT_ADAPTIVE_WEIGHTS = {
     "breakout": 1.0,
     "macro": 1.0,
     "entry_quality": 1.0,
+    "market_structure": 1.0,
+    "anchored_vwap": 1.0,
+    "volume_profile": 1.0,
 }
 
 
@@ -56,15 +59,38 @@ def _weighted_market_scores(
     for item in indicators:
         tf_weight = TF_WEIGHTS.get(item.timeframe, 0.1)
 
-        trend_component = abs(item.directional_score) * tf_weight * _weight(adaptive_weights, "ema_trend")
+        structure_weight = _weight(adaptive_weights, "market_structure")
+        trend_component = abs(item.directional_score) * tf_weight * structure_weight
         if item.directional_score > 0:
             bullish += trend_component
         elif item.directional_score < 0:
             bearish += trend_component
-        if item.trend == "bullish":
-            buy_reasons.append(f"{item.timeframe}: EMA structure and slope favor buyers")
-        elif item.trend == "bearish":
-            sell_reasons.append(f"{item.timeframe}: EMA structure and slope favor sellers")
+        if item.structure_bias == "bullish":
+            buy_reasons.append(f"{item.timeframe}: market structure {item.market_structure} favors buyers")
+        elif item.structure_bias == "bearish":
+            sell_reasons.append(f"{item.timeframe}: market structure {item.market_structure} favors sellers")
+
+        avwap_points = 9 * tf_weight * _weight(adaptive_weights, "anchored_vwap")
+        if item.avwap_active is not None:
+            if item.close > item.avwap_active and (item.avwap_slope_atr or 0) >= -0.05:
+                bullish += avwap_points
+                buy_reasons.append(f"{item.timeframe}: price holds above {item.avwap_anchor.replace('_',' ')} anchored VWAP")
+            elif item.close < item.avwap_active and (item.avwap_slope_atr or 0) <= 0.05:
+                bearish += avwap_points
+                sell_reasons.append(f"{item.timeframe}: price holds below {item.avwap_anchor.replace('_',' ')} anchored VWAP")
+
+        profile_points = 9 * tf_weight * _weight(adaptive_weights, "volume_profile")
+        if item.profile_acceptance == "bullish" or item.profile_state == "ABOVE_VALUE":
+            bullish += profile_points
+            buy_reasons.append(f"{item.timeframe}: volume profile accepts price above value")
+        elif item.profile_acceptance == "bearish" or item.profile_state == "BELOW_VALUE":
+            bearish += profile_points
+            sell_reasons.append(f"{item.timeframe}: volume profile accepts price below value")
+        elif item.profile_poc is not None:
+            if item.close > item.profile_poc:
+                bullish += profile_points * 0.35
+            elif item.close < item.profile_poc:
+                bearish += profile_points * 0.35
 
         momentum_points = 10 * tf_weight * _weight(adaptive_weights, "momentum")
         if item.momentum == "bullish":
@@ -81,37 +107,25 @@ def _weighted_market_scores(
             elif (item.minus_di or 0) > (item.plus_di or 0):
                 bearish += dmi_points
 
-        super_points = 6 * tf_weight * _weight(adaptive_weights, "ema_trend")
-        if item.supertrend_direction == "bullish":
-            bullish += super_points
-        elif item.supertrend_direction == "bearish":
-            bearish += super_points
-
-        vwap_points = 5 * tf_weight * _weight(adaptive_weights, "vwap")
-        if item.vwap is not None:
-            if item.close > item.vwap:
-                bullish += vwap_points
-            else:
-                bearish += vwap_points
-
-        if item.volume_ratio is not None and item.volume_ratio >= 1.05:
-            volume_points = min(7, 3.5 * item.volume_ratio) * tf_weight * _weight(adaptive_weights, "volume")
-            if (item.volume_delta_proxy or 0) > 0:
-                bullish += volume_points
-                buy_reasons.append(f"{item.timeframe}: activity expanded with positive candle pressure")
-            elif (item.volume_delta_proxy or 0) < 0:
-                bearish += volume_points
-                sell_reasons.append(f"{item.timeframe}: activity expanded with negative candle pressure")
+        # EMA remains a low-weight secondary confirmation only. It cannot
+        # override market structure, anchored VWAP, or volume-profile context.
+        ema_points = 2.5 * tf_weight * _weight(adaptive_weights, "ema_trend")
+        if item.ema20 is not None and item.ema50 is not None:
+            if item.close > item.ema20 > item.ema50:
+                bullish += ema_points
+            elif item.close < item.ema20 < item.ema50:
+                bearish += ema_points
 
         breakout_points = 9 * tf_weight * _weight(adaptive_weights, "breakout")
-        if item.breakout_up:
+        if item.breakout_up or item.market_structure in {"BOS_UP", "CHOCH_UP"}:
             bullish += breakout_points
-            buy_reasons.append(f"{item.timeframe}: price broke the prior 20-bar high")
-        if item.breakout_down:
+            buy_reasons.append(f"{item.timeframe}: market structure broke upward")
+        if item.breakout_down or item.market_structure in {"BOS_DOWN", "CHOCH_DOWN"}:
             bearish += breakout_points
-            sell_reasons.append(f"{item.timeframe}: price broke the prior 20-bar low")
+            sell_reasons.append(f"{item.timeframe}: market structure broke downward")
 
     return bullish, bearish, buy_reasons, sell_reasons
+
 
 
 def _market_stats(indicators: list[IndicatorSnapshot]) -> dict[str, float | int | bool]:
@@ -235,7 +249,7 @@ def _entry_candidate(
 
     if side == "BUY":
         candidates = [level for level in supports if price - h1_atr * 0.85 <= level <= price]
-        for level in (m15.ema20, m15.vwap, h1.ema20):
+        for level in (m15.avwap_active, h1.avwap_active, m15.profile_poc, h1.profile_poc, m15.vwap):
             if level is not None and price - h1_atr * 0.85 <= level <= price:
                 candidates.append(float(level))
         if candidates:
@@ -245,7 +259,7 @@ def _entry_candidate(
             return level + m15_atr * 0.05, "PULLBACK TO NEAREST SUPPORT/VALUE"
     else:
         candidates = [level for level in resistances if price <= level <= price + h1_atr * 0.85]
-        for level in (m15.ema20, m15.vwap, h1.ema20):
+        for level in (m15.avwap_active, h1.avwap_active, m15.profile_poc, h1.profile_poc, m15.vwap):
             if level is not None and price <= level <= price + h1_atr * 0.85:
                 candidates.append(float(level))
         if candidates:
@@ -436,7 +450,7 @@ def build_technical_report(
         raise ValueError("The supplied market price is invalid.")
 
     weights = {**DEFAULT_ADAPTIVE_WEIGHTS, **(adaptive_weights or {})}
-    targets = {"tp1": 0.80, "tp2": 1.30, "tp3": 1.80, **(target_multipliers or {})}
+    targets = {"tp1": 0.65, "tp2": 1.05, "tp3": 1.40, **(target_multipliers or {})}
     risk = risk_inputs or RiskInputs()
 
     bullish, bearish, buy_reasons, sell_reasons = _weighted_market_scores(indicators, weights)
@@ -470,8 +484,8 @@ def build_technical_report(
     average_adx = float(stats["average_adx"])
     average_chop = float(stats["average_chop"])
     compression_count = int(stats["compressions"])
-    breakout_up = bool(stats["breakout_up"] and (m15.volume_ratio or 0) >= 1.02)
-    breakout_down = bool(stats["breakout_down"] and (m15.volume_ratio or 0) >= 1.02)
+    breakout_up = bool(stats["breakout_up"] and (m15.profile_acceptance == "bullish" or m15.profile_state == "ABOVE_VALUE" or m15.close > float(m15.profile_poc or m15.close)))
+    breakout_down = bool(stats["breakout_down"] and (m15.profile_acceptance == "bearish" or m15.profile_state == "BELOW_VALUE" or m15.close < float(m15.profile_poc or m15.close)))
     net = bullish - bearish
 
     # Directional resolution is evaluated before the trap label.  A liquidity
@@ -483,20 +497,18 @@ def build_technical_report(
     bear_dmi = h1_adx >= 18 and float(h1.minus_di or 0) > float(h1.plus_di or 0)
     bull_momentum = h1.momentum == "bullish" and (m15.momentum == "bullish" or breakout_up or m15.structure_break_up)
     bear_momentum = h1.momentum == "bearish" and (m15.momentum == "bearish" or breakout_down or m15.structure_break_down)
-    h1_above_value = h1.close > float(h1.ema20 or h1.vwap or h1.close)
-    h1_below_value = h1.close < float(h1.ema20 or h1.vwap or h1.close)
-    h1_above_fast = h1.close > float(h1.ema9 or h1.ema20 or h1.close)
-    h1_below_fast = h1.close < float(h1.ema9 or h1.ema20 or h1.close)
+    h1_above_value = h1.close > float(h1.avwap_active or h1.vwap or h1.ema20 or h1.close)
+    h1_below_value = h1.close < float(h1.avwap_active or h1.vwap or h1.ema20 or h1.close)
+    h1_above_fast = h1.close > float(h1.avwap_active or h1.ema9 or h1.ema20 or h1.close)
+    h1_below_fast = h1.close < float(h1.avwap_active or h1.ema9 or h1.ema20 or h1.close)
 
     m15_bull_impulse = bool(
         ((m15.impulse_1_atr or 0) >= 0.42 or (m15.impulse_3_atr or 0) >= 0.78)
         and (m15.close_location or 0.5) >= 0.62
-        and (m15.volume_ratio or 1.0) >= 0.90
     )
     m15_bear_impulse = bool(
         ((m15.impulse_1_atr or 0) <= -0.42 or (m15.impulse_3_atr or 0) <= -0.78)
         and (m15.close_location or 0.5) <= 0.38
-        and (m15.volume_ratio or 1.0) >= 0.90
     )
     h1_bull_impulse = bool(
         (h1.impulse_1_atr or 0) >= 0.30
@@ -747,9 +759,9 @@ def build_technical_report(
             signal_label = f"{market_state} BIAS · RISK TOO HIGH"
 
     notes = [
-        "The decision engine combines multi-timeframe trend, momentum, DMI/ADX, ATR, VWAP, volume/activity, support/resistance, liquidity and a required DXY/US10Y/gold-flow execution gate.",
+        "The decision engine prioritizes multi-timeframe market structure, anchored VWAP and volume-profile acceptance, then confirms with momentum, DMI/ADX, ATR, liquidity and the DXY/US10Y/gold-flow execution gate.",
         "Stops remain outside structural invalidation. Position size is reduced when that stop is too expensive; the engine does not invent a dangerously tight stop to accommodate a large lot.",
-        "Targets are capped by reachable ATR range and adaptive historical maximum-favourable-excursion statistics.",
+        "Targets begin with a conservative 0.65R / 1.05R / 1.40R ladder and adapt only from clean pre-exit excursion evidence.",
         "Adaptive learning is bounded, evidence-weighted and based on completed signals; it cannot guarantee future accuracy.",
     ]
     notes.extend(extra_notes or [])
