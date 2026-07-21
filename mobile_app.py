@@ -14,10 +14,12 @@ import streamlit as st
 from dotenv import load_dotenv
 
 from gold_web_terminal.adaptive_engine import AdaptiveEngine, derive_feature_votes
+from gold_web_terminal.alerts import AlertConfig, AlertState, build_alert_events, dispatch_events, record_non_alert_states, send_test_alert
 from gold_web_terminal.ai_engine import research_gold_news, synthesize_ai_analysis
 from gold_web_terminal.config import Settings
 from gold_web_terminal.demo_data import generate_demo_bars
 from gold_web_terminal.indicators import add_indicators, summarize_indicators
+from gold_web_terminal.fvg_strategy import detect_four_hour_fvg_signal
 from gold_web_terminal.liquidity import analyze_liquidity
 from gold_web_terminal.macro_mobile_v542 import fetch_macro_confirmation, refresh_macro_confirmation
 from gold_web_terminal.market_data import MarketBundle, TwelveDataClient
@@ -43,7 +45,7 @@ try:
 except Exception:
     pass
 
-BUILD_VERSION = "5.4.3-mobile-settings-compat-hotfix"
+BUILD_VERSION = "5.7.0-mobile-avwap-volume-profile"
 TIMEFRAMES = ["M5", "M15", "H1", "H4", "D1"]
 TV_INTERVALS = {"M5": "5", "M15": "15", "H1": "60", "H4": "240", "D1": "D"}
 
@@ -186,7 +188,7 @@ def tradingview_widget(symbol: str, timeframe: str) -> None:
         "timezone": "Etc/UTC",
         "withdateranges": "1",
         "locale": "en",
-        "studies": "MACD@tv-basicstudies,RSI@tv-basicstudies,Volume@tv-basicstudies",
+        "studies": "MACD@tv-basicstudies,RSI@tv-basicstudies,VWAP@tv-basicstudies",
     }
     st.iframe("https://s.tradingview.com/widgetembed/?" + urlencode(params), width="stretch", height=610)
 
@@ -258,6 +260,40 @@ def signal_card(report: TechnicalReport, final_state: str, final_note: str) -> s
     return f'''<div class="signal-shell"><div class="signal-overline">Current execution state</div><div class="signal-title state-{css_state}">{escape(title)}</div><div class="signal-copy">{escape(copy)}</div>{plan}</div>'''
 
 
+def special_strategy_card(signal) -> str:
+    state = getattr(signal, "state", "NONE")
+    side = getattr(signal, "side", "NONE")
+    state_tone = "state-buy" if state == "TRIGGERED" and side == "BUY" else "state-sell" if state == "TRIGGERED" and side == "SELL" else "state-stuck"
+    side_tone = "state-buy" if side == "BUY" else "state-sell" if side == "SELL" else "state-stuck"
+
+    def fv(value):
+        return "—" if value is None else f"{float(value):,.2f}"
+
+    levels = ""
+    if getattr(signal, "entry_low", None) is not None:
+        levels = (
+            '<div class="levels-grid">'
+            f'<div class="level-box wide"><span>FVG / entry</span><strong>{fv(signal.entry_low)} – {fv(signal.entry_high)}</strong></div>'
+            f'<div class="level-box"><span>Stop loss</span><strong class="state-sell">{fv(signal.stop_loss)}</strong></div>'
+            f'<div class="level-box"><span>TP1</span><strong class="state-buy">{fv(signal.take_profit_1)}</strong></div>'
+            f'<div class="level-box"><span>TP2</span><strong class="state-buy">{fv(signal.take_profit_2)}</strong></div>'
+            f'<div class="level-box"><span>TP3</span><strong class="state-buy">{fv(signal.take_profit_3)}</strong></div>'
+            '</div>'
+        )
+    reasons = "".join(
+        f'<div class="mobile-callout">• {escape(str(item))}</div>'
+        for item in getattr(signal, "rationale", [])[:5]
+    )
+    agreement = "YES" if getattr(signal, "aligns_with_primary", False) else "NO"
+    return (
+        '<div class="signal-shell">'
+        '<div class="signal-overline">Specialist strategy · 4H candle + M15 FVG</div>'
+        f'<div class="signal-title {side_tone}">{escape(side)} · <span class="{state_tone}">{escape(state)}</span></div>'
+        f'<div class="signal-copy">Confidence {int(getattr(signal, "confidence", 0))}% · Regular engine agreement {agreement} · Macro {escape(str(getattr(signal, "macro_gate", "UNAVAILABLE")))}</div>'
+        f'{levels}{reasons}</div>'
+    )
+
+
 # Optional private access PIN.
 app_pin = os.getenv("APP_PIN", "").strip()
 if app_pin and not st.session_state.get("mobile_unlocked"):
@@ -278,9 +314,9 @@ settings = Settings.from_env()
 # while GitHub/Streamlit finishes replacing package files.
 auto_refresh_default = bool(getattr(settings, "auto_refresh_enabled", True))
 try:
-    auto_refresh_seconds = max(60, int(getattr(settings, "auto_refresh_seconds", 90)))
+    auto_refresh_seconds = max(60, int(getattr(settings, "auto_refresh_seconds", 1200)))
 except (TypeError, ValueError):
-    auto_refresh_seconds = 90
+    auto_refresh_seconds = 1200
 feed_live = bool(settings.twelve_data_api_key)
 st.markdown(
     f'<div class="mobile-header"><div class="mobile-brand"><div class="mobile-logo">Au</div><div><div class="mobile-title">AURUMEDGE ADAPTIVE MOBILE</div><div class="mobile-sub">XAU/USD · macro gate · adaptive brain · {BUILD_VERSION}</div></div></div><div class="mobile-live">{"LIVE FEED" if feed_live else "DEMO"}</div></div>',
@@ -297,7 +333,7 @@ with st.container(border=True):
     c1, c2 = st.columns([1, 1], vertical_alignment="center")
     with c1:
         auto_enabled = st.toggle(
-            "90-second auto sync",
+            f"{max(1, auto_refresh_seconds // 60)}-minute auto sync",
             value=auto_refresh_default,
             key="mobile_auto_refresh_enabled",
             help="Refreshes all timeframes together. Switching charts uses the stored synchronized snapshot.",
@@ -311,6 +347,17 @@ with st.container(border=True):
     if st.button("↻ SYNC ALL TIMEFRAMES", use_container_width=True):
         clear_full_market_cache("Manual all-timeframe synchronization")
         st.rerun()
+    if bool(getattr(settings, "free_plan_mode", True)):
+        watcher_minutes = max(5, int(getattr(settings, "cloud_watcher_minutes", 5)))
+        daily_limit = int(getattr(settings, "provider_daily_limit", 800))
+        ui_runs = max(1, 1440 // max(1, auto_refresh_seconds // 60))
+        watcher_runs = 1440 // watcher_minutes
+        projected_credits = (ui_runs + watcher_runs) * 2
+        st.caption(
+            f"Free-plan profile: cloud watcher every {watcher_minutes} min + open-app sync every "
+            f"{max(1, auto_refresh_seconds // 60)} min ≈ {projected_credits}/{daily_limit} candle credits per day. "
+            "Timeframe switching uses the stored all-timeframe snapshot and consumes no extra request."
+        )
 
 with st.expander("CFD risk profile", expanded=False):
     rc1, rc2 = st.columns(2)
@@ -472,6 +519,36 @@ report = build_technical_report(
     trap_age=int(decision_memory.get("trap_age", 0)),
 )
 
+signal_time = frames["M15"].iloc[-1]["time"]
+feature_votes = derive_feature_votes(indicator_snapshots, liquidity_snapshots, macro, report.market_state)
+report = adaptive.apply_capital_preservation(report, signal_time, feature_votes)
+
+four_hour_fvg = detect_four_hour_fvg_signal(
+    frames,
+    indicators=indicator_snapshots,
+    macro=macro,
+    primary_state=report.market_state,
+    risk_inputs=risk_inputs,
+    digits=2,
+) if bool(getattr(settings, "h4_fvg_strategy_enabled", True)) else None
+if four_hour_fvg is not None:
+    report.special_signals = [four_hour_fvg]
+
+mobile_alert_messages: list[str] = []
+if bool(getattr(settings, "local_alerts_enabled", False)):
+    alert_cfg = AlertConfig.from_env()
+    state_path = Path(getattr(settings, "alert_state_path", "data/alert_state.json"))
+    if not state_path.is_absolute():
+        state_path = APP_DIR / state_path
+    alert_state = AlertState(state_path)
+    sent_ids, alert_errors = dispatch_events(
+        build_alert_events(report, four_hour_fvg), alert_cfg, alert_state
+    )
+    record_non_alert_states(report, four_hour_fvg, alert_cfg, alert_state)
+    if sent_ids:
+        mobile_alert_messages.append(f"Sent {len(sent_ids)} new alert(s).")
+    mobile_alert_messages.extend(alert_errors)
+
 if report.market_state == "TRAP":
     if decision_memory.get("state") != "TRAP" or decision_memory.get("trap_anchor_price") is None:
         decision_memory["trap_anchor_price"] = report.last_price
@@ -483,9 +560,8 @@ else:
     decision_memory["trap_age"] = 0
 decision_memory["state"] = report.market_state
 
-feature_votes = derive_feature_votes(indicator_snapshots, liquidity_snapshots, macro, report.market_state)
 if report.market_state in {"BUY", "SELL"} and report.active_setup is not None:
-    adaptive.register_signal(report, frames["M15"].iloc[-1]["time"], feature_votes, timeframe="M15")
+    adaptive.register_signal(report, signal_time, feature_votes, timeframe="M15")
 
 # Optional paid AI research remains manual. The adaptive technical/macro engine
 # owns prices, entries, stops and targets.
@@ -525,9 +601,14 @@ st.markdown(
 st.markdown('<div class="mobile-section">Macro confirmation</div>', unsafe_allow_html=True)
 st.markdown(macro_cards(macro), unsafe_allow_html=True)
 st.markdown(signal_card(report, final_state, final_note), unsafe_allow_html=True)
+st.markdown('<div class="mobile-section">4H candle + M15 FVG strategy</div>', unsafe_allow_html=True)
+if four_hour_fvg is not None:
+    st.markdown(special_strategy_card(four_hour_fvg), unsafe_allow_html=True)
+for _msg in mobile_alert_messages:
+    st.caption(_msg)
 
-tabs = st.tabs(["SIGNAL", "MACRO", "CHART", "LEVELS", "MOMENTUM", "BRAIN", "MORE"])
-signal_tab, macro_tab, chart_tab, levels_tab, momentum_tab, brain_tab, more_tab = tabs
+tabs = st.tabs(["SIGNAL", "MACRO", "4H FVG", "ALERTS", "CHART", "LEVELS", "MOMENTUM", "BRAIN", "MORE"])
+signal_tab, macro_tab, fvg_tab, alerts_tab, chart_tab, levels_tab, momentum_tab, brain_tab, more_tab = tabs
 
 with signal_tab:
     st.markdown('<div class="mobile-section">Multi-timeframe decision stack</div>', unsafe_allow_html=True)
@@ -575,7 +656,7 @@ with signal_tab:
     st.code(summary, language=None)
 
 with macro_tab:
-    if st.button("REFRESH MACRO", use_container_width=True, help="Forces a fresh DXY and yield lookup. Gold 4H is refreshed every 90-second sync."):
+    if st.button("REFRESH MACRO", use_container_width=True, help="Forces a fresh DXY and yield lookup. Gold 4H is refreshed on every all-timeframe sync."):
         st.session_state["force_macro_refresh"] = True
         st.rerun()
     st.markdown(macro_cards(macro), unsafe_allow_html=True)
@@ -600,6 +681,37 @@ with macro_tab:
             "gold_change_4h": macro.gold_change_4h,
         })
 
+with fvg_tab:
+    st.markdown('<div class="mobile-section">4H displacement and fair-value-gap continuation</div>', unsafe_allow_html=True)
+    if four_hour_fvg is not None:
+        st.markdown(special_strategy_card(four_hour_fvg), unsafe_allow_html=True)
+        for item in four_hour_fvg.warnings:
+            st.markdown(f'<div class="mobile-callout">• {escape(str(item))}</div>', unsafe_allow_html=True)
+    st.caption("WATCH = parent candle qualifies. ARMED = price is inside the FVG. TRIGGERED = an M15 confirmation candle has closed in the parent direction.")
+
+with alerts_tab:
+    st.markdown('<div class="mobile-section">Signal notifications</div>', unsafe_allow_html=True)
+    cfg = AlertConfig.from_env()
+    telegram_status = "READY" if cfg.telegram_enabled else "NOT SET"
+    email_status = "READY" if cfg.email_enabled else "NOT SET"
+    forming_status = "ON" if cfg.forming_alerts else "OFF"
+    st.markdown(
+        '<div class="brain-grid">'
+        f'<div class="brain-card"><span>Telegram push</span><strong>{telegram_status}</strong><small>Best option for instant iPhone notification</small></div>'
+        f'<div class="brain-card"><span>Email alerts</span><strong>{email_status}</strong><small>SMTP delivery</small></div>'
+        f'<div class="brain-card"><span>Minimum confidence</span><strong>{cfg.minimum_confidence}%</strong><small>Lower-quality signals are not sent</small></div>'
+        f'<div class="brain-card"><span>Forming alerts</span><strong>{forming_status}</strong><small>ARMED FVG alerts; TRIGGERED is always eligible</small></div>'
+        '</div>',
+        unsafe_allow_html=True,
+    )
+    if st.button("SEND TEST NOTIFICATION", key="mobile_test_notification", use_container_width=True):
+        delivered, errors = send_test_alert(cfg)
+        if delivered:
+            st.success("Test notification sent.")
+        else:
+            st.error("No channel configured or delivery failed: " + "; ".join(errors))
+    st.markdown('<div class="mobile-callout">For alerts while this app is closed, install the included GitHub Actions workflow. Streamlit auto-refresh only runs while a session is open.</div>', unsafe_allow_html=True)
+
 with chart_tab:
     st.markdown('<div class="mobile-section">Professional market map</div>', unsafe_allow_html=True)
     st.markdown(
@@ -609,7 +721,7 @@ with chart_tab:
         ),
         unsafe_allow_html=True,
     )
-    st.caption("Safari-safe SVG chart with candles, EMA20/50/200, VWAP, Supertrend, volume, support/resistance, liquidity and active setup levels.")
+    st.caption("Safari-safe chart with market structure, anchored VWAP, volume profile, secondary EMA context, support/resistance, liquidity and active setup levels.")
 
 with levels_tab:
     st.markdown('<div class="mobile-section">Nearest price levels</div>', unsafe_allow_html=True)
@@ -654,7 +766,10 @@ with momentum_tab:
             "ADX": round(float(item.adx14 or 0), 1),
             "ATR%": round(float(item.atr_pct or 0), 2),
             "MACD H": round(float(item.macd_hist or 0), 2),
-            "Vol ratio": round(float(item.volume_ratio or 0), 2),
+            "Structure": item.market_structure,
+            "AVWAP": round(float(item.avwap_active or 0), 2),
+            "Profile": item.profile_state,
+            "POC": round(float(item.profile_poc or 0), 2),
         })
     st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
 
@@ -663,8 +778,8 @@ with brain_tab:
     st.markdown(f'''<div class="brain-grid">
 <div class="brain-card"><span>Reviewed signals</span><strong>{summary.reviewed_signals}</strong><small>Completed evidence only</small></div>
 <div class="brain-card"><span>Win rate</span><strong>{summary.win_rate:.1f}%</strong><small>{summary.wins} wins · {summary.losses} losses · {summary.timeouts} timeouts</small></div>
-<div class="brain-card"><span>Adaptive targets</span><strong>{summary.target_r_multipliers['tp1']:.2f}R / {summary.target_r_multipliers['tp2']:.2f}R / {summary.target_r_multipliers['tp3']:.2f}R</strong><small>Bounded from historical favourable movement</small></div>
-<div class="brain-card"><span>Learning mode</span><strong>{'ACTIVE' if summary.enabled else 'OFF'}</strong><small>Minimum samples {settings.adaptive_min_samples}</small></div>
+<div class="brain-card"><span>Adaptive targets</span><strong>{summary.target_r_multipliers['tp1']:.2f}R / {summary.target_r_multipliers['tp2']:.2f}R / {summary.target_r_multipliers['tp3']:.2f}R</strong><small>Capital-preservation defaults, then clean pre-exit movement</small></div>
+<div class="brain-card"><span>Learning mode</span><strong>{'ACTIVE' if summary.enabled else 'OFF'}</strong><small>Confidence cap {adaptive.confidence_cap()}% · full learning near {settings.adaptive_min_samples} samples</small></div>
 </div>''', unsafe_allow_html=True)
     st.markdown(f'<div class="mobile-callout"><strong>Latest review</strong><br>{escape(summary.last_review)}</div>', unsafe_allow_html=True)
     weight_rows = [{"Feature": k.replace("_", " ").title(), "Weight": round(v, 3), "Samples": summary.indicator_samples.get(k, 0)} for k, v in summary.indicator_weights.items()]
@@ -727,6 +842,8 @@ with more_tab:
             "us10y_source": macro.us10y.source,
             "gold_4h_move": macro.gold_change_4h,
             "adaptive_reviewed_signals": adaptive.summary().reviewed_signals,
+            "h4_fvg_state": four_hour_fvg.state if four_hour_fvg else "DISABLED",
+            "h4_fvg_side": four_hour_fvg.side if four_hour_fvg else "NONE",
             "risk_status": rp.status if rp else "NO_SETUP",
             "recommended_lot": rp.recommended_lot if rp else None,
             "broker_connected": False,
