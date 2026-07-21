@@ -1,1 +1,107 @@
+name: AurumEdge Signal Watch
 
+on:
+  workflow_dispatch:
+    inputs:
+      test_alert:
+        description: "Send a test notification instead of checking the market"
+        required: false
+        default: false
+        type: boolean
+  schedule:
+    # Five-minute checks during the main Monday-Friday UTC sessions.
+    - cron: "2-57/5 * * * 1-5"
+    # Gold commonly reopens late Sunday UTC; include the first two hours.
+    - cron: "2-57/5 22-23 * * 0"
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  watch-xauusd:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    concurrency:
+      group: aurumedge-signal-watch
+      cancel-in-progress: true
+    steps:
+      - name: Check out terminal
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements-alerts.txt
+
+      - name: Install watcher dependencies
+        run: python -m pip install --upgrade pip && pip install -r requirements-alerts.txt
+
+      - name: Restore alert deduplication state
+        uses: actions/cache/restore@v4
+        with:
+          path: data/alert_state.json
+          key: aurumedge-alert-state-${{ github.run_id }}
+          restore-keys: |
+            aurumedge-alert-state-
+
+      - name: Send test notification
+        if: github.event_name == 'workflow_dispatch' && inputs.test_alert == true
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USERNAME: ${{ secrets.SMTP_USERNAME }}
+          SMTP_APP_PASSWORD: ${{ secrets.SMTP_APP_PASSWORD }}
+          ALERT_EMAIL_FROM: ${{ secrets.ALERT_EMAIL_FROM }}
+          ALERT_EMAIL_TO: ${{ secrets.ALERT_EMAIL_TO }}
+        run: python signal_watcher.py --test-alert
+
+      - name: Check signals and send notifications
+        if: github.event_name != 'workflow_dispatch' || inputs.test_alert != true
+        id: watcher
+        env:
+          TWELVE_DATA_API_KEY: ${{ secrets.TWELVE_DATA_API_KEY }}
+          MARKET_SYMBOL: XAU/USD
+          BARS_PER_TIMEFRAME: "500"
+          FREE_PLAN_MODE: "true"
+          PROVIDER_DAILY_LIMIT: "800"
+          CLOUD_WATCHER_MINUTES: "5"
+          MACRO_ENABLED: "true"
+          MACRO_REQUIRED_FOR_ENTRY: "true"
+          H4_FVG_STRATEGY_ENABLED: "true"
+          ALERT_MIN_CONFIDENCE: ${{ secrets.ALERT_MIN_CONFIDENCE }}
+          ALERT_FORMING_ENABLED: ${{ secrets.ALERT_FORMING_ENABLED }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USERNAME: ${{ secrets.SMTP_USERNAME }}
+          SMTP_APP_PASSWORD: ${{ secrets.SMTP_APP_PASSWORD }}
+          ALERT_EMAIL_FROM: ${{ secrets.ALERT_EMAIL_FROM }}
+          ALERT_EMAIL_TO: ${{ secrets.ALERT_EMAIL_TO }}
+          ALERT_STATE_PATH: data/alert_state.json
+        run: python signal_watcher.py
+
+      - name: Detect changed alert state
+        if: github.event_name != 'workflow_dispatch' || inputs.test_alert != true
+        id: state
+        run: |
+          if [ -f data/.alert_state_changed ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Save alert deduplication state
+        if: (github.event_name != 'workflow_dispatch' || inputs.test_alert != true) && steps.state.outputs.changed == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: data/alert_state.json
+          key: aurumedge-alert-state-${{ github.run_id }}
