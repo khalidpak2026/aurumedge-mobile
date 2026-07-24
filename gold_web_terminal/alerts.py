@@ -1,46 +1,23 @@
 from __future__ import annotations
 
-"""Entry-live and trade-lifecycle alerts for AurumEdge v5.8.1."""
-
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 from datetime import datetime, timezone
+from email.message import EmailMessage
 import json
+import math
 import os
 from pathlib import Path
 import smtplib
-from email.message import EmailMessage
+import ssl
 from typing import Any, Iterable
-from urllib.parse import urlencode
-from urllib.request import Request, urlopen
 
+import requests
 
-def _utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-def _get(obj: Any, name: str, default: Any = None) -> Any:
-    if isinstance(obj, dict):
-        return obj.get(name, default)
-    return getattr(obj, name, default)
-
-
-def _float(obj: Any, name: str, default: float = 0.0) -> float:
-    try:
-        return float(_get(obj, name, default))
-    except (TypeError, ValueError):
-        return default
-
-
-def _bool_env(name: str, default: bool = False) -> bool:
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    return raw.strip().lower() in {"1", "true", "yes", "on"}
+from .models import FourHourFVGSignal, TechnicalReport
 
 
 @dataclass(slots=True)
 class AlertConfig:
-    minimum_confidence: int = 65
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
     smtp_host: str = ""
@@ -49,27 +26,30 @@ class AlertConfig:
     smtp_password: str = ""
     email_from: str = ""
     email_to: str = ""
+    minimum_confidence: int = 65
+    forming_alerts: bool = False  # retained for backward compatibility
 
     @classmethod
     def from_env(cls) -> "AlertConfig":
         try:
-            minimum = int(os.getenv("ALERT_MIN_CONFIDENCE", "65"))
-        except ValueError:
-            minimum = 65
-        try:
             port = int(os.getenv("SMTP_PORT", "587"))
         except ValueError:
             port = 587
+        try:
+            confidence = int(os.getenv("ALERT_MIN_CONFIDENCE", "65"))
+        except ValueError:
+            confidence = 65
         return cls(
-            minimum_confidence=max(0, min(100, minimum)),
             telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN", "").strip(),
             telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID", "").strip(),
             smtp_host=os.getenv("SMTP_HOST", "").strip(),
             smtp_port=port,
             smtp_username=os.getenv("SMTP_USERNAME", "").strip(),
             smtp_password=os.getenv("SMTP_APP_PASSWORD", os.getenv("SMTP_PASSWORD", "")).strip(),
-            email_from=os.getenv("ALERT_EMAIL_FROM", "").strip(),
+            email_from=os.getenv("ALERT_EMAIL_FROM", os.getenv("SMTP_USERNAME", "")).strip(),
             email_to=os.getenv("ALERT_EMAIL_TO", "").strip(),
+            minimum_confidence=max(50, min(90, confidence)),
+            forming_alerts=os.getenv("ALERT_FORMING_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"},
         )
 
     @property
@@ -78,176 +58,279 @@ class AlertConfig:
 
     @property
     def email_enabled(self) -> bool:
-        return bool(self.smtp_host and self.email_from and self.email_to)
+        return bool(self.smtp_host and self.smtp_username and self.smtp_password and self.email_to)
+
+    @property
+    def enabled(self) -> bool:
+        return self.telegram_enabled or self.email_enabled
 
 
 @dataclass(slots=True)
 class AlertEvent:
     event_id: str
-    kind: str
     title: str
     message: str
-    confidence: int = 100
+    category: str
+    confidence: int
+    transition_key: str = ""
+    transition_value: str = ""
     symbol: str = "XAU/USD"
     side: str = ""
-    created_at: str = ""
-
-    def __post_init__(self) -> None:
-        if not self.created_at:
-            self.created_at = _utc_now()
+    signal_id: str = ""
 
 
 class AlertState:
-    def __init__(self, path: str | Path) -> None:
+    """Backward-compatible alert state with entry/close lifecycle tracking."""
+
+    def __init__(self, path: str | Path = "data/alert_state.json") -> None:
         self.path = Path(path)
-        self.data = {"version": 2, "sent": {}, "last_states": {}, "last_event": None, "open_entries": {}}
-        try:
-            if self.path.exists():
-                parsed = json.loads(self.path.read_text(encoding="utf-8"))
-                if isinstance(parsed, dict):
-                    self.data.update(parsed)
-        except (OSError, json.JSONDecodeError):
-            pass
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.data = {
+            "version": 2,
+            "sent": {},
+            "transitions": {},
+            "open_entries": {},
+            "updated_at": "",
+        }
+        if self.path.exists():
+            try:
+                loaded = json.loads(self.path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    self.data.update(loaded)
+            except Exception:
+                pass
         if not isinstance(self.data.get("sent"), dict):
             self.data["sent"] = {}
+        if not isinstance(self.data.get("transitions"), dict):
+            self.data["transitions"] = {}
         if not isinstance(self.data.get("open_entries"), dict):
             self.data["open_entries"] = {}
-        last = self.data.get("last_event")
-        if not self.data["open_entries"] and isinstance(last, dict) and last.get("kind") == "ENTRY":
-            symbol = str(last.get("symbol") or "XAU/USD")
-            self.data["open_entries"][symbol] = {
-                "side": str(last.get("side") or ""),
-                "event_id": str(last.get("event_id") or "legacy-entry"),
-                "sent_at": str(last.get("created_at") or _utc_now()),
-            }
 
-    def was_sent(self, event_id: str) -> bool:
-        return event_id in self.data.get("sent", {})
-
-    def has_open_entry(self, symbol: str) -> bool:
-        return str(symbol) in self.data.get("open_entries", {})
-
-    def mark_sent(self, event: AlertEvent, channels: list[str]) -> None:
-        self.data.setdefault("sent", {})[event.event_id] = {
-            "sent_at": _utc_now(),
-            "kind": event.kind,
-            "channels": channels,
-            "title": event.title,
-        }
-        # Bound state growth while retaining enough history for deduplication.
-        sent = self.data["sent"]
-        if len(sent) > 1500:
-            newest = list(sent.items())[-1000:]
-            self.data["sent"] = dict(newest)
-        if event.kind == "ENTRY":
-            self.data.setdefault("open_entries", {})[event.symbol] = {
-                "side": event.side,
-                "event_id": event.event_id,
-                "sent_at": _utc_now(),
-            }
-        elif event.kind == "CLOSE":
-            self.data.setdefault("open_entries", {}).pop(event.symbol, None)
-        self.data["last_event"] = asdict(event)
-        self.save()
-
-    def save(self) -> None:
+    def _save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.data["updated_at"] = datetime.now(timezone.utc).isoformat()
         temporary = self.path.with_suffix(self.path.suffix + ".tmp")
         temporary.write_text(json.dumps(self.data, indent=2), encoding="utf-8")
         temporary.replace(self.path)
 
+    def was_sent(self, event_id: str) -> bool:
+        return event_id in self.data.get("sent", {})
 
-def _entry_event(report: Any) -> AlertEvent | None:
-    state = str(_get(report, "market_state", ""))
-    setup = _get(report, "active_setup")
-    if state not in {"BUY", "SELL"} or setup is None:
+    def transition(self, key: str) -> str:
+        return str(self.data.get("transitions", {}).get(key, ""))
+
+    def has_open_entry(self, symbol: str = "XAU/USD") -> bool:
+        return str(symbol) in self.data.get("open_entries", {})
+
+    def set_transition(self, key: str, value: str) -> None:
+        transitions = self.data.setdefault("transitions", {})
+        if transitions.get(key) == value:
+            return
+        transitions[key] = value
+        self._save()
+
+    def mark_sent(self, event: AlertEvent) -> None:
+        sent = self.data.setdefault("sent", {})
+        sent[event.event_id] = {
+            "title": event.title,
+            "category": event.category,
+            "confidence": event.confidence,
+            "sent_at": datetime.now(timezone.utc).isoformat(),
+        }
+        if len(sent) > 500:
+            ordered = sorted(sent.items(), key=lambda item: item[1].get("sent_at", ""), reverse=True)[:350]
+            self.data["sent"] = dict(ordered)
+        if event.transition_key:
+            self.data.setdefault("transitions", {})[event.transition_key] = event.transition_value
+        if event.category == "THREE_PILLAR_ENTRY_LIVE":
+            self.data.setdefault("open_entries", {})[event.symbol] = {
+                "side": event.side,
+                "signal_id": event.signal_id,
+                "event_id": event.event_id,
+                "sent_at": datetime.now(timezone.utc).isoformat(),
+            }
+        elif event.category.startswith("TRADE_CLOSE_"):
+            self.data.setdefault("open_entries", {}).pop(event.symbol, None)
+            self.data.setdefault("transitions", {})["primary_entry_live"] = "WAIT"
+        self._save()
+
+
+def _finite(value: object, fallback: float = 0.0) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return fallback
+    return number if math.isfinite(number) else fallback
+
+
+def _m15_atr(report: TechnicalReport) -> float:
+    item = next((row for row in report.indicators if row.timeframe == "M15"), None)
+    return max(_finite(getattr(item, "atr14", None), 2.5), 0.5)
+
+
+def _inside_live_zone(price: float, low: float, high: float, atr: float) -> bool:
+    tolerance = max(0.20 * atr, 0.35)
+    return float(low) - tolerance <= float(price) <= float(high) + tolerance
+
+
+def _distance_to_zone(price: float, low: float, high: float) -> float:
+    if low <= price <= high:
+        return 0.0
+    return low - price if price < low else price - high
+
+
+def is_primary_entry_live(report: TechnicalReport) -> bool:
+    setup = report.active_setup
+    if report.market_state not in {"BUY", "SELL"} or setup is None or setup.status != "ENTER":
+        return False
+    price = float(report.last_price)
+    if not _inside_live_zone(price, setup.entry_low, setup.entry_high, _m15_atr(report)):
+        return False
+    if report.market_state == "BUY" and price >= setup.take_profit_1:
+        return False
+    if report.market_state == "SELL" and price <= setup.take_profit_1:
+        return False
+    return True
+
+
+def is_primary_entry_near(report: TechnicalReport, atr_fraction: float = 0.65) -> bool:
+    """True when an executable setup is close enough to justify fast refresh."""
+    setup = report.active_setup
+    if report.market_state not in {"BUY", "SELL"} or setup is None or setup.status != "ENTER":
+        return False
+    price = float(report.last_price)
+    if report.market_state == "BUY" and price >= setup.take_profit_1:
+        return False
+    if report.market_state == "SELL" and price <= setup.take_profit_1:
+        return False
+    threshold = max(_m15_atr(report) * max(0.20, atr_fraction), 0.75)
+    return _distance_to_zone(price, float(setup.entry_low), float(setup.entry_high)) <= threshold
+
+
+def is_fvg_entry_live(report: TechnicalReport, special: FourHourFVGSignal | None) -> bool:
+    if special is None or special.side not in {"BUY", "SELL"} or special.state != "TRIGGERED":
+        return False
+    if special.entry_low is None or special.entry_high is None:
+        return False
+    price = float(report.last_price)
+    if not _inside_live_zone(price, special.entry_low, special.entry_high, _m15_atr(report)):
+        return False
+    if special.take_profit_1 is not None:
+        if special.side == "BUY" and price >= float(special.take_profit_1):
+            return False
+        if special.side == "SELL" and price <= float(special.take_profit_1):
+            return False
+    return True
+
+
+def _macro_line(report: TechnicalReport) -> str:
+    macro = report.macro
+    if macro is None:
+        return "DXY/US10Y context: unavailable (not a signal gate)"
+    return f"Context only — DXY {macro.dxy.direction} | US10Y {macro.us10y.direction}; neither can block this signal"
+
+
+def _pillar_line(report: TechnicalReport) -> str:
+    rows = {item.timeframe: item for item in report.indicators}
+    parts: list[str] = []
+    for tf in ("M15", "H1", "H4"):
+        item = rows.get(tf)
+        if item is None:
+            continue
+        structure = item.structure_bias.upper()
+        avwap = "ABOVE" if item.avwap_active is not None and item.close > item.avwap_active else "BELOW" if item.avwap_active is not None else "N/A"
+        parts.append(f"{tf}: structure {structure}, AVWAP {avwap}, profile {item.profile_state}")
+    return " | ".join(parts)
+
+
+def _setup_lines(report: TechnicalReport) -> list[str]:
+    setup = report.active_setup
+    if setup is None:
+        return []
+    return [
+        f"ENTRY NOW {setup.entry_low:.2f}–{setup.entry_high:.2f}",
+        f"SL {setup.stop_loss:.2f}",
+        f"TP {setup.take_profit_1:.2f} / {setup.take_profit_2:.2f} / {setup.take_profit_3:.2f}",
+        f"Risk status {setup.risk_plan.status if setup.risk_plan else 'UNAVAILABLE'}",
+    ]
+
+
+def _entry_event(report: TechnicalReport) -> AlertEvent | None:
+    if not is_primary_entry_live(report):
         return None
-    risk_plan = _get(setup, "risk_plan")
-    if str(_get(risk_plan, "status", "OK")) == "BLOCK":
-        return None
-    price = _float(report, "last_price")
-    low = _float(setup, "entry_low")
-    high = _float(setup, "entry_high")
-    atr = max(_float(setup, "atr", 1.0), 0.01)
-    adjacent = max(min(_float(setup, "entry_tolerance", atr * 0.12), atr * 0.12), 0.08)
-    entry_live = bool(_get(setup, "entry_live", False)) or low <= price <= high
-    immediately_beside = low - adjacent <= price <= high + adjacent
-    if not (entry_live or immediately_beside):
-        return None
-    symbol = str(_get(report, "symbol", "XAU/USD"))
-    entry_mid = _float(setup, "entry_price", (low + high) / 2.0)
-    stop = _float(setup, "stop_loss")
-    tp1 = _float(setup, "take_profit_1")
-    confidence = int(_float(report, "confidence", 0))
-    # Rounded geometry keeps one live setup deduplicated across small feed changes.
-    key = f"entry:{symbol}:{state}:{entry_mid:.1f}:{stop:.1f}:{tp1:.1f}"
-    pillars = _get(report, "pillar_votes", {}) or _get(setup, "pillar_votes", {}) or {}
-    pillar_text = ", ".join(
-        f"{name.replace('_', ' ').title()}={'BUY' if int(pillars.get(name, 0)) > 0 else 'SELL' if int(pillars.get(name, 0)) < 0 else 'NEUTRAL'}"
-        for name in ("market_structure", "anchored_vwap", "volume_profile")
-    )
-    message = (
-        f"ENTRY LIVE — {state} {symbol}\n"
-        f"Current price: {price:.2f}\n"
-        f"Entry zone: {low:.2f} – {high:.2f}\n"
-        f"Stop loss: {stop:.2f}\n"
-        f"TP1: {tp1:.2f}\n"
-        f"Confidence: {confidence}%\n"
-        f"{pillar_text}\n"
-        "DXY and US10Y are display-only context. Verify the broker quote before execution."
-    )
+    setup = report.active_setup
+    assert setup is not None
+    candle_time = next((item.timestamp for item in report.indicators if item.timeframe == "M15"), report.data_time)
+    setup_key = f"{report.market_state}|{setup.entry_low:.2f}|{setup.entry_high:.2f}|{setup.stop_loss:.2f}"
+    signal_id = f"{report.symbol}|M15|{candle_time}|{report.market_state}"
+    lines = [
+        "ENTRY PRICE HAS ARRIVED",
+        f"XAU/USD live {report.last_price:.2f} | {report.market_state} | confidence {report.confidence}%",
+        *_setup_lines(report),
+        _pillar_line(report),
+        _macro_line(report),
+        "Signal basis: market structure + anchored VWAP + volume profile only.",
+        "Valid only while live price remains inside/next to this entry zone. Do not chase later.",
+    ]
     return AlertEvent(
-        event_id=key,
-        kind="ENTRY",
-        title=f"AurumEdge ENTRY LIVE — {state} {symbol}",
-        message=message,
-        confidence=confidence,
-        symbol=symbol,
-        side=state,
+        event_id=f"THREE_PILLAR_ENTRY|{setup_key}|{candle_time}",
+        title=f"XAU/USD {report.market_state} — ENTRY LIVE NOW",
+        message="\n".join(lines),
+        category="THREE_PILLAR_ENTRY_LIVE",
+        confidence=report.confidence,
+        transition_key="primary_entry_live",
+        transition_value=setup_key,
+        symbol=report.symbol,
+        side=report.market_state,
+        signal_id=signal_id,
     )
 
 
 def _close_events(review_outcomes: Iterable[dict[str, Any]] | None) -> list[AlertEvent]:
     events: list[AlertEvent] = []
     for review in review_outcomes or []:
-        outcome = str(review.get("outcome") or review.get("status") or "").upper()
+        outcome = str(review.get("status") or review.get("outcome") or "").upper()
         if outcome not in {"WIN", "LOSS", "TIMEOUT"}:
             continue
-        signal_id = str(review.get("signal_id") or "unknown")
-        side = str(review.get("side") or "")
+        signal_id = str(review.get("id") or review.get("signal_id") or "unknown")
         symbol = str(review.get("symbol") or "XAU/USD")
-        mfe = float(review.get("mfe_r") or 0.0)
-        mae = float(review.get("mae_r") or 0.0)
-        exit_price = float(review.get("exit_price") or 0.0)
-        label = "TP1 HIT" if outcome == "WIN" else "STOP LOSS HIT" if outcome == "LOSS" else "TRADE TIMEOUT"
-        message = (
-            f"{label} — {side} {symbol}\n"
-            f"Outcome: {outcome}\n"
-            f"Exit/last price: {exit_price:.2f}\n"
-            f"MFE: {mfe:.2f}R · MAE: {mae:.2f}R\n"
-            f"Bars held: {int(review.get('bars_held') or 0)}\n"
-            "The adaptive brain stored this result and updated bounded three-pillar statistics."
+        side = str(review.get("side") or "")
+        outcome_time = str(review.get("outcome_time") or review.get("reviewed_at") or "")
+        result_label = "TP1 HIT" if outcome == "WIN" else "STOP LOSS HIT" if outcome == "LOSS" else "TIMEOUT CLOSED"
+        event_id = f"TRADE_CLOSE|{signal_id}|{outcome}|{outcome_time}"
+        message = "\n".join(
+            [
+                f"{symbol} {side} — {result_label}",
+                f"Outcome price: {_finite(review.get('outcome_price'), 0.0):.2f}",
+                f"MFE: {_finite(review.get('mfe_r'), 0.0):.2f}R | MAE: {_finite(review.get('mae_r'), 0.0):.2f}R",
+                f"Bars observed: {int(_finite(review.get('bars_observed'), 0.0))}",
+                "The adaptive brain has recorded this completed trade and updated only bounded three-pillar statistics.",
+            ]
         )
         events.append(
             AlertEvent(
-                event_id=f"close:{signal_id}:{outcome}",
-                kind="CLOSE",
-                title=f"AurumEdge {label} — {side} {symbol}",
+                event_id=event_id,
+                title=f"{symbol} {side} — {result_label}",
                 message=message,
+                category=f"TRADE_CLOSE_{outcome}",
                 confidence=100,
+                transition_key=f"trade_close:{signal_id}",
+                transition_value=outcome,
                 symbol=symbol,
                 side=side,
+                signal_id=signal_id,
             )
         )
     return events
 
 
 def build_alert_events(
-    report: Any,
-    special: Any | None = None,
+    report: TechnicalReport,
+    special: FourHourFVGSignal | None = None,
     review_outcomes: Iterable[dict[str, Any]] | None = None,
 ) -> list[AlertEvent]:
-    """Return current entry plus completed-trade events. FVG is intentionally ignored."""
+    """Build close alerts plus one deduplicated live three-pillar entry alert."""
+    del special
     events = _close_events(review_outcomes)
     entry = _entry_event(report)
     if entry is not None:
@@ -255,30 +338,29 @@ def build_alert_events(
     return events
 
 
-def _send_telegram(config: AlertConfig, event: AlertEvent) -> None:
-    endpoint = f"https://api.telegram.org/bot{config.telegram_bot_token}/sendMessage"
-    body = urlencode({"chat_id": config.telegram_chat_id, "text": f"{event.title}\n\n{event.message}"}).encode("utf-8")
-    request = Request(endpoint, data=body, method="POST")
-    with urlopen(request, timeout=20) as response:  # noqa: S310 - fixed Telegram endpoint
-        payload = json.loads(response.read().decode("utf-8"))
-    if not payload.get("ok"):
-        raise RuntimeError(str(payload.get("description") or "Telegram delivery failed"))
+def send_telegram(config: AlertConfig, event: AlertEvent) -> None:
+    url = f"https://api.telegram.org/bot{config.telegram_bot_token}/sendMessage"
+    response = requests.post(
+        url,
+        json={"chat_id": config.telegram_chat_id, "text": f"{event.title}\n\n{event.message}"},
+        timeout=20,
+    )
+    response.raise_for_status()
 
 
-def _send_email(config: AlertConfig, event: AlertEvent) -> None:
-    message = EmailMessage()
-    message["Subject"] = event.title
-    message["From"] = config.email_from
-    message["To"] = config.email_to
-    message.set_content(event.message)
+def send_email(config: AlertConfig, event: AlertEvent) -> None:
+    msg = EmailMessage()
+    msg["Subject"] = event.title
+    msg["From"] = config.email_from or config.smtp_username
+    msg["To"] = config.email_to
+    msg.set_content(event.message)
+    context = ssl.create_default_context()
     with smtplib.SMTP(config.smtp_host, config.smtp_port, timeout=25) as server:
         server.ehlo()
-        if config.smtp_port != 25 or _bool_env("SMTP_STARTTLS", True):
-            server.starttls()
-            server.ehlo()
-        if config.smtp_username:
-            server.login(config.smtp_username, config.smtp_password)
-        server.send_message(message)
+        server.starttls(context=context)
+        server.ehlo()
+        server.login(config.smtp_username, config.smtp_password)
+        server.send_message(msg)
 
 
 def dispatch_events(
@@ -289,54 +371,62 @@ def dispatch_events(
     sent: list[str] = []
     errors: list[str] = []
     for event in events:
-        if event.kind == "ENTRY" and event.confidence < config.minimum_confidence:
-            continue
-        if event.kind == "ENTRY" and state.has_open_entry(event.symbol):
+        if event.confidence < config.minimum_confidence:
             continue
         if state.was_sent(event.event_id):
             continue
-        delivered_channels: list[str] = []
+        if event.transition_key and state.transition(event.transition_key) == event.transition_value:
+            continue
+        delivered = False
         if config.telegram_enabled:
             try:
-                _send_telegram(config, event)
-                delivered_channels.append("telegram")
-            except Exception as exc:  # network/provider error should not expose secrets
-                errors.append(f"{event.event_id}: Telegram: {exc}")
+                send_telegram(config, event)
+                delivered = True
+            except Exception as exc:
+                errors.append(f"Telegram {event.event_id}: {exc.__class__.__name__}")
         if config.email_enabled:
             try:
-                _send_email(config, event)
-                delivered_channels.append("email")
+                send_email(config, event)
+                delivered = True
             except Exception as exc:
-                errors.append(f"{event.event_id}: Email: {exc}")
-        if delivered_channels:
-            state.mark_sent(event, delivered_channels)
+                errors.append(f"Email {event.event_id}: {exc.__class__.__name__}")
+        if delivered:
+            state.mark_sent(event)
             sent.append(event.event_id)
     return sent, errors
 
 
 def record_non_alert_states(
-    report: Any,
-    special: Any | None,
+    report: TechnicalReport,
+    special: FourHourFVGSignal | None,
     config: AlertConfig,
     state: AlertState,
 ) -> None:
-    state.data.setdefault("last_states", {})[str(_get(report, "symbol", "XAU/USD"))] = {
-        "market_state": str(_get(report, "market_state", "STUCK")),
-        "entry_live": bool(_get(report, "entry_live", False)),
-        "updated_at": _utc_now(),
-    }
-    state.save()
+    del special, config
+    if not is_primary_entry_live(report):
+        state.set_transition("primary_entry_live", "WAIT")
 
 
 def send_test_alert(config: AlertConfig) -> tuple[bool, list[str]]:
     event = AlertEvent(
-        event_id=f"test:{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}",
-        kind="TEST",
-        title="AurumEdge notification test",
-        message="The AurumEdge Mobile v5.8.1 notification channel is working.",
+        event_id=f"TEST|{datetime.now(timezone.utc).isoformat()}",
+        title="AurumEdge test notification",
+        message="Notification delivery is configured correctly. No trade signal is attached to this test.",
+        category="TEST",
+        confidence=100,
     )
-    temporary = AlertState(Path(os.getenv("ALERT_STATE_PATH", "data/alert_state.json")))
-    sent, errors = dispatch_events([event], config, temporary)
-    if not config.telegram_enabled and not config.email_enabled:
-        errors.append("No Telegram or email channel is configured.")
-    return bool(sent), errors
+    errors: list[str] = []
+    delivered = False
+    if config.telegram_enabled:
+        try:
+            send_telegram(config, event)
+            delivered = True
+        except Exception as exc:
+            errors.append(f"Telegram: {exc}")
+    if config.email_enabled:
+        try:
+            send_email(config, event)
+            delivered = True
+        except Exception as exc:
+            errors.append(f"Email: {exc}")
+    return delivered, errors
