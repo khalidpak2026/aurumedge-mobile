@@ -1,18 +1,10 @@
 from __future__ import annotations
 
-"""AurumEdge Mobile v5.8.1 scheduled watcher.
-
-Normal GitHub scheduling remains five minutes. When an entry or TP1/SL is near,
---burst performs up to four checks approximately 45 seconds apart inside the
-same workflow job.
-"""
-
 import argparse
 import json
 import os
 from pathlib import Path
 import time
-from typing import Any
 
 from dotenv import load_dotenv
 
@@ -22,12 +14,15 @@ from gold_web_terminal.alerts import (
     AlertState,
     build_alert_events,
     dispatch_events,
+    is_primary_entry_live,
+    is_primary_entry_near,
     record_non_alert_states,
     send_test_alert,
 )
 from gold_web_terminal.config import Settings
 from gold_web_terminal.indicators import add_indicators, summarize_indicators
 from gold_web_terminal.liquidity import analyze_liquidity
+from gold_web_terminal.macro_data import fetch_macro_confirmation
 from gold_web_terminal.market_data import TwelveDataClient
 from gold_web_terminal.risk_engine import RiskInputs
 from gold_web_terminal.strategy import build_technical_report
@@ -35,33 +30,23 @@ from gold_web_terminal.strategy import build_technical_report
 APP_DIR = Path(__file__).resolve().parent
 load_dotenv(APP_DIR / ".env")
 TIMEFRAMES = ["M5", "M15", "H1", "H4", "D1"]
-
-
-def _setting(settings: Any, name: str, default: Any) -> Any:
-    value = getattr(settings, name, default)
-    return default if value is None else value
+BUILD_VERSION = "5.8.3-mobile-restored-ui-lifecycle"
 
 
 def risk_inputs(settings: Settings) -> RiskInputs:
-    values = {
-        "account_balance": _setting(settings, "account_balance", 10000.0),
-        "risk_percent": _setting(settings, "risk_percent", 1.0),
-        "requested_lot": _setting(settings, "requested_lot", 0.10),
-        "contract_size": _setting(settings, "contract_size", 100.0),
-        "lot_step": _setting(settings, "lot_step", 0.01),
-        "min_lot": _setting(settings, "min_lot", 0.01),
-        "maximum_risk_dollars": _setting(settings, "maximum_risk_dollars", 0.0),
-        "spread_price": _setting(settings, "spread_price", 0.0),
-        "slippage_price": _setting(settings, "slippage_price", 0.0),
-        "minimum_stop_atr": _setting(settings, "minimum_stop_atr", 0.55),
-        "maximum_stop_atr": _setting(settings, "maximum_stop_atr", 1.60),
-    }
-    try:
-        return RiskInputs(**values)
-    except TypeError:
-        # Compatibility with an older risk model exposing fewer fields.
-        supported = getattr(RiskInputs, "model_fields", None) or getattr(RiskInputs, "__fields__", {})
-        return RiskInputs(**{key: value for key, value in values.items() if key in supported})
+    return RiskInputs(
+        account_balance=settings.account_balance,
+        risk_percent=settings.risk_percent,
+        requested_lot=settings.requested_lot,
+        contract_size=settings.contract_size,
+        lot_step=settings.lot_step,
+        min_lot=settings.min_lot,
+        maximum_risk_dollars=settings.maximum_risk_dollars,
+        spread_price=settings.spread_price,
+        slippage_price=settings.slippage_price,
+        minimum_stop_atr=settings.minimum_stop_atr,
+        maximum_stop_atr=settings.maximum_stop_atr,
+    )
 
 
 def _resolve_path(raw: str | Path) -> Path:
@@ -77,68 +62,56 @@ def _text_or_empty(path: Path) -> str:
 
 
 def _write_change_marker(path: Path, name: str, changed: bool) -> None:
+    # A burst can change state on its first pass and not on later passes. Never
+    # remove a marker once this job has observed a change.
+    if not changed:
+        return
     marker = path.parent / name
     marker.parent.mkdir(parents=True, exist_ok=True)
-    if changed:
-        marker.write_text("true", encoding="utf-8")
-    elif marker.exists():
-        marker.unlink()
+    marker.write_text("true", encoding="utf-8")
 
 
-def _fetch_macro_context(settings: Settings, frames: dict[str, Any], preliminary_state: str) -> Any | None:
-    if not bool(_setting(settings, "macro_enabled", True)):
-        return None
-    api_key = str(_setting(settings, "twelve_data_api_key", ""))
-    dxy_symbol = str(_setting(settings, "dxy_symbol", "DXY"))
-    us10y_symbol = str(_setting(settings, "us10y_symbol", "US10Y"))
-    gold_h1 = frames["H1"][["time", "close"]].copy()
-    try:
-        from gold_web_terminal.macro_data import fetch_macro_confirmation
-
-        return fetch_macro_confirmation(api_key, dxy_symbol, us10y_symbol, gold_h1, preliminary_state)
-    except Exception:
-        try:
-            from gold_web_terminal.macro_mobile_v542 import fetch_macro_confirmation
-
-            return fetch_macro_confirmation(api_key, dxy_symbol, us10y_symbol, gold_h1, preliminary_state)
-        except Exception:
-            return None
+def _clear_change_markers(settings: Settings) -> None:
+    for state_path, marker_name in (
+        (_resolve_path(settings.alert_state_path), ".alert_state_changed"),
+        (_resolve_path(settings.adaptive_state_path), ".adaptive_state_changed"),
+    ):
+        marker = state_path.parent / marker_name
+        if marker.exists():
+            try:
+                marker.unlink()
+            except OSError:
+                pass
 
 
-def _setup_value(report: Any, name: str, default: Any = None) -> Any:
-    setup = getattr(report, "active_setup", None)
-    if isinstance(setup, dict):
-        return setup.get(name, default)
-    return getattr(setup, name, default) if setup is not None else default
-
-
-def run_once(dry_run: bool = False, emit: bool = True) -> dict[str, Any]:
+def run_once(dry_run: bool = False, emit: bool = True) -> dict:
     settings = Settings.from_env()
-    api_key = str(_setting(settings, "twelve_data_api_key", "")).strip()
-    if not api_key:
+    if not settings.twelve_data_api_key:
         raise RuntimeError("TWELVE_DATA_API_KEY is required for the signal watcher.")
 
-    symbol = str(_setting(settings, "market_symbol", "XAU/USD"))
-    bars = int(_setting(settings, "bars_per_timeframe", 500))
-    bundle = TwelveDataClient(api_key).fetch_bundle(symbol, TIMEFRAMES, bars)
+    bundle = TwelveDataClient(settings.twelve_data_api_key).fetch_bundle(
+        settings.market_symbol, TIMEFRAMES, settings.bars_per_timeframe
+    )
     frames = {tf: add_indicators(bundle.frames[tf]) for tf in TIMEFRAMES}
     indicators = [summarize_indicators(frames[tf], tf) for tf in TIMEFRAMES]
     liquidity = [analyze_liquidity(frames[tf], tf) for tf in ["M15", "H1", "H4", "D1"]]
 
-    adaptive_path = _resolve_path(str(_setting(settings, "adaptive_state_path", "data/adaptive_state.json")))
-    alert_state_path = _resolve_path(str(_setting(settings, "alert_state_path", "data/alert_state.json")))
+    adaptive_path = _resolve_path(settings.adaptive_state_path)
     before_adaptive = _text_or_empty(adaptive_path)
-    before_alert = _text_or_empty(alert_state_path)
     adaptive = AdaptiveEngine(
         adaptive_path,
-        enabled=bool(_setting(settings, "adaptive_learning", True)),
-        minimum_samples=int(_setting(settings, "adaptive_min_samples", 20)),
-        horizon_bars=int(_setting(settings, "adaptive_horizon_bars", 12)),
-        max_weight_change=float(_setting(settings, "adaptive_max_weight_change", 0.05)),
+        enabled=settings.adaptive_learning,
+        minimum_samples=settings.adaptive_min_samples,
+        horizon_bars=settings.adaptive_horizon_bars,
+        max_weight_change=settings.adaptive_max_weight_change,
     )
-
-    review_outcomes = [] if dry_run else adaptive.review_pending(frames)
+    completed = adaptive.review_pending(frames) if not dry_run else []
+    close_reviews = adaptive.pending_close_reviews() if not dry_run else []
+    summary = adaptive.summary()
     risk = risk_inputs(settings)
+
+    # Direction is calculated before macro. DXY and US10Y are display-only and
+    # can never stop, reverse or reduce a three-pillar signal.
     preliminary = build_technical_report(
         symbol=bundle.symbol,
         data_time=bundle.data_time,
@@ -149,11 +122,26 @@ def run_once(dry_run: bool = False, emit: bool = True) -> dict[str, Any]:
         digits=2,
         adaptive_weights=adaptive.weights(),
         target_multipliers=adaptive.target_multipliers(),
-        adaptive_summary=adaptive.summary(),
+        adaptive_summary=summary,
         risk_inputs=risk,
         macro_required_for_entry=False,
     )
-    macro = _fetch_macro_context(settings, frames, str(getattr(preliminary, "market_state", "STUCK")))
+
+    macro = None
+    macro_error = ""
+    if settings.macro_enabled:
+        try:
+            gold_h1 = frames["H1"][["time", "close"]].copy()
+            macro = fetch_macro_confirmation(
+                settings.twelve_data_api_key,
+                settings.dxy_symbol,
+                settings.us10y_symbol,
+                gold_h1,
+                preliminary.market_state,
+            )
+        except Exception as exc:
+            macro_error = f"{exc.__class__.__name__}: {exc}"
+
     report = build_technical_report(
         symbol=bundle.symbol,
         data_time=bundle.data_time,
@@ -164,86 +152,94 @@ def run_once(dry_run: bool = False, emit: bool = True) -> dict[str, Any]:
         digits=2,
         adaptive_weights=adaptive.weights(),
         target_multipliers=adaptive.target_multipliers(),
-        adaptive_summary=adaptive.summary(),
+        adaptive_summary=summary,
         risk_inputs=risk,
         macro=macro,
-        macro_required_for_entry=False,  # DXY/US10Y are display-only.
+        macro_required_for_entry=False,
     )
+
     signal_time = frames["M15"].iloc[-1]["time"]
-    feature_votes = dict(getattr(report, "pillar_votes", {}) or {})
-    if not feature_votes:
-        feature_votes = derive_feature_votes(indicators, liquidity, macro, getattr(report, "market_state", "STUCK"))
+    feature_votes = derive_feature_votes(indicators, liquidity, macro, report.market_state)
     report = adaptive.apply_capital_preservation(report, signal_time, feature_votes)
 
     config = AlertConfig.from_env()
+    alert_state_path = _resolve_path(settings.alert_state_path)
+    before_alert = _text_or_empty(alert_state_path)
     alert_state = AlertState(alert_state_path)
-    events = build_alert_events(report, review_outcomes=review_outcomes)
+    events = build_alert_events(report, None, review_outcomes=close_reviews)
+    entry_live = is_primary_entry_live(report)
+    near_entry = is_primary_entry_near(report)
+    near_exit = adaptive.pending_near_exit(float(report.last_price))
+
     if dry_run:
         sent, errors = [], []
         registered = False
     else:
         sent, errors = dispatch_events(events, config, alert_state)
         record_non_alert_states(report, None, config, alert_state)
-        entry_events = [event for event in events if event.kind == "ENTRY"]
-        delivered_entry = next(
-            (
-                event
-                for event in entry_events
-                if event.event_id in sent or alert_state.was_sent(event.event_id)
-            ),
-            None,
-        )
-        registered = False
-        if delivered_entry is not None:
-            registered = adaptive.register_signal(
-                report,
-                signal_time,
-                feature_votes,
-                timeframe="M15",
-                delivery_event_id=delivered_entry.event_id,
-            )
+        closed_signal_ids = [
+            event.signal_id
+            for event in events
+            if event.category.startswith("TRADE_CLOSE_")
+            and (event.event_id in sent or alert_state.was_sent(event.event_id))
+        ]
+        adaptive.mark_close_alerted(closed_signal_ids)
+        eligible = entry_live and report.confidence >= config.minimum_confidence
+        entry_event = next((event for event in events if event.category == "THREE_PILLAR_ENTRY_LIVE"), None)
+        registered = adaptive.register_signal(
+            report,
+            signal_time,
+            feature_votes,
+            timeframe="M15",
+            delivery_event_id=entry_event.event_id if entry_event is not None else "",
+        ) if eligible else False
         adaptive.save()
 
-    price = float(getattr(report, "last_price", bundle.last_price))
-    state = str(getattr(report, "market_state", "STUCK"))
-    entry_live = bool(getattr(report, "entry_live", False) or _setup_value(report, "entry_live", False))
-    near_entry = bool(getattr(report, "near_entry", False) or _setup_value(report, "near_entry", False))
-    near_exit = adaptive.pending_near_exit(price)
-    recommended = 30 if entry_live or near_exit else 45 if near_entry else 120 if state in {"BUY", "SELL"} else 300
-
-    after_adaptive = _text_or_empty(adaptive_path)
     after_alert = _text_or_empty(alert_state_path)
-    adaptive_changed = before_adaptive != after_adaptive
+    after_adaptive = _text_or_empty(adaptive_path)
     alert_changed = before_alert != after_alert
-    _write_change_marker(adaptive_path, ".adaptive_state_changed", adaptive_changed)
+    adaptive_changed = before_adaptive != after_adaptive
     _write_change_marker(alert_state_path, ".alert_state_changed", alert_changed)
+    _write_change_marker(adaptive_path, ".adaptive_state_changed", adaptive_changed)
 
+    state = report.market_state
+    recommended_poll_seconds = (
+        30 if entry_live or near_exit
+        else 45 if near_entry
+        else 120 if state in {"BUY", "SELL"}
+        else 300
+    )
+    macro_context = {
+        "dxy": macro.dxy.direction if macro is not None else "UNAVAILABLE",
+        "us10y": macro.us10y.direction if macro is not None else "UNAVAILABLE",
+        "non_blocking": True,
+        "error": macro_error,
+    }
     output = {
-        "build": "5.8.1-mobile-entry-lifecycle",
+        "build": BUILD_VERSION,
+        "engine": "THREE_PILLAR",
         "data_time": bundle.data_time,
-        "price": price,
-        "primary_state": state,
-        "primary_confidence": int(getattr(report, "confidence", 0)),
-        "execution_label": str(getattr(report, "execution_label", "")),
+        "price": report.last_price,
+        "state": state,
+        "confidence": report.confidence,
         "entry_live": entry_live,
         "near_entry": near_entry,
         "near_exit": near_exit,
-        "recommended_poll_seconds": recommended,
+        "recommended_poll_seconds": recommended_poll_seconds,
         "events": [event.event_id for event in events],
         "sent": sent,
         "errors": errors,
-        "registered_delivered_entry": registered,
-        "pending_trades": adaptive.pending_trade_count(),
-        "review_outcomes": review_outcomes,
-        "last_review": str(adaptive.state.get("last_review", "")),
-        "pillar_votes": getattr(report, "pillar_votes", {}),
-        "macro_context": {
-            "dxy": getattr(getattr(macro, "dxy", None), "direction", "UNAVAILABLE") if macro is not None else "UNAVAILABLE",
-            "us10y": getattr(getattr(macro, "us10y", None), "direction", "UNAVAILABLE") if macro is not None else "UNAVAILABLE",
-            "blocks_signal": False,
+        "macro_context": macro_context,
+        "learning": {
+            "reviews_this_run": len(completed),
+            "registered": registered,
+            "pending_trades": adaptive.pending_trade_count(),
+            "pending_close_alerts": len(adaptive.pending_close_reviews()),
+            "last_review": adaptive.state.get("last_review", ""),
+            "counts": adaptive.state.get("counts", {}),
+            "state_changed": adaptive_changed,
         },
-        "alert_channels": {"telegram": config.telegram_enabled, "email": config.email_enabled},
-        "adaptive_state_changed": adaptive_changed,
+        "review_outcomes": completed,
         "alert_state_changed": alert_changed,
     }
     if emit:
@@ -251,10 +247,12 @@ def run_once(dry_run: bool = False, emit: bool = True) -> dict[str, Any]:
     return output
 
 
-def run_burst(dry_run: bool = False) -> dict[str, Any]:
-    results: list[dict[str, Any]] = []
+def run_burst(dry_run: bool = False) -> dict:
+    settings = Settings.from_env()
+    _clear_change_markers(settings)
     maximum_checks = max(1, min(4, int(os.getenv("BURST_MAX_CHECKS", "4"))))
     interval = max(30, min(90, int(os.getenv("BURST_INTERVAL_SECONDS", "45"))))
+    results: list[dict] = []
     for index in range(maximum_checks):
         result = run_once(dry_run=dry_run, emit=True)
         results.append(result)
@@ -281,15 +279,17 @@ def run_burst(dry_run: bool = False) -> dict[str, Any]:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="AurumEdge v5.8.1 XAU/USD signal watcher")
-    parser.add_argument("--dry-run", action="store_true", help="Calculate without alerts or learning changes")
-    parser.add_argument("--test-alert", action="store_true", help="Send one notification-channel test")
-    parser.add_argument("--burst", action="store_true", help="Use adaptive near-entry/near-exit burst checks")
+    parser = argparse.ArgumentParser(description="AurumEdge restored mobile three-pillar signal watcher")
+    parser.add_argument("--dry-run", action="store_true", help="Calculate without sending alerts or updating learning")
+    parser.add_argument("--test-alert", action="store_true", help="Send a test alert using configured channels")
+    parser.add_argument("--burst", action="store_true", help="Run fast checks while entry, TP1 or SL is near")
     args = parser.parse_args()
     if args.test_alert:
         ok, errors = send_test_alert(AlertConfig.from_env())
         print(json.dumps({"delivered": ok, "errors": errors}, indent=2))
         raise SystemExit(0 if ok else 1)
+    settings = Settings.from_env()
+    _clear_change_markers(settings)
     if args.burst:
         run_burst(dry_run=args.dry_run)
     else:

@@ -1,1 +1,1 @@
-5.8.2-mobile-json-hotfix
+5.8.3-mobile-restored-ui-lifecycle
