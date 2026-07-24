@@ -30,7 +30,7 @@ try:
 except Exception:
     pass
 
-BUILD_VERSION = "5.8.1-mobile-entry-lifecycle"
+BUILD_VERSION = "5.8.2-mobile-json-hotfix"
 TIMEFRAMES = ["M5", "M15", "H1", "H4", "D1"]
 
 st.set_page_config(
@@ -108,9 +108,33 @@ def _fetch_bundle(api_key: str, symbol: str, bars: int) -> Any:
     return TwelveDataClient(api_key).fetch_bundle(symbol, TIMEFRAMES, bars)
 
 
+def _split_json_frame(payload: str) -> pd.DataFrame:
+    """Decode a pandas orient=split payload without treating it as a path."""
+    decoded = json.loads(payload)
+    if not isinstance(decoded, dict):
+        raise ValueError("Invalid split JSON payload")
+
+    columns = decoded.get("columns", [])
+    data = decoded.get("data", [])
+    index = decoded.get("index")
+    if not isinstance(columns, list) or not isinstance(data, list):
+        raise ValueError("Invalid split JSON structure")
+
+    frame = pd.DataFrame(data=data, columns=columns, index=index)
+    if "time" in frame.columns:
+        frame["time"] = pd.to_datetime(frame["time"], utc=True, errors="coerce")
+    return frame
+
+
 @st.cache_data(ttl=300, show_spinner=False)
 def _macro_context(api_key: str, dxy: str, us10y: str, gold_h1_json: str, state: str) -> Any | None:
-    gold_h1 = pd.read_json(gold_h1_json, orient="split")
+    # Macro is display-only. Any decode/API/import failure must degrade to
+    # UNAVAILABLE instead of stopping the terminal or blocking a signal.
+    try:
+        gold_h1 = _split_json_frame(gold_h1_json)
+    except Exception:
+        return None
+
     try:
         from gold_web_terminal.macro_mobile_v542 import fetch_macro_confirmation
 

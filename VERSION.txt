@@ -1,1 +1,1 @@
-5.8.1-mobile-entry-lifecycle
+5.8.2-mobile-json-hotfix
