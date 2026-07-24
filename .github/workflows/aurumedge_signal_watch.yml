@@ -1,50 +1,51 @@
 name: AurumEdge Signal Watch
 
 on:
+  schedule:
+    - cron: "*/5 * * * *"
   workflow_dispatch:
     inputs:
       test_alert:
-        description: "Send a test notification instead of checking the market"
+        description: Send a notification test instead of checking the market
         required: false
         default: false
         type: boolean
-  schedule:
-    # 24/7 cloud checks every five minutes. Closed-market runs normally see no
-    # new candle and therefore do not register a duplicate signal.
-    - cron: "2-57/5 * * * *"
 
 permissions:
   contents: write
 
-defaults:
-  run:
-    shell: bash
+concurrency:
+  group: aurumedge-signal-watch
+  cancel-in-progress: false
 
 jobs:
-  watch-xauusd:
+  watch:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
-    concurrency:
-      group: aurumedge-signal-watch
-      cancel-in-progress: false
+    timeout-minutes: 12
 
     steps:
-      - name: Check out terminal
+      - name: Check out repository
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           cache: pip
-          cache-dependency-path: requirements-alerts.txt
+          cache-dependency-path: |
+            requirements.txt
+            requirements-alerts.txt
 
       - name: Install watcher dependencies
-        run: python -m pip install --upgrade pip && pip install -r requirements-alerts.txt
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements-alerts.txt ]; then
+            pip install -r requirements-alerts.txt
+          else
+            pip install -r requirements.txt
+          fi
 
-      - name: Restore 24/7 alert and learning state
+      - name: Restore newest alert and learning state
         uses: actions/cache/restore@v4
         with:
           path: |
@@ -54,23 +55,9 @@ jobs:
           restore-keys: |
             aurumedge-runtime-state-
 
-      - name: Send test notification
-        if: github.event_name == 'workflow_dispatch' && inputs.test_alert == true
+      - name: Check signals, learn outcomes and send notifications
         env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          SMTP_HOST: ${{ secrets.SMTP_HOST }}
-          SMTP_PORT: ${{ secrets.SMTP_PORT }}
-          SMTP_USERNAME: ${{ secrets.SMTP_USERNAME }}
-          SMTP_APP_PASSWORD: ${{ secrets.SMTP_APP_PASSWORD }}
-          ALERT_EMAIL_FROM: ${{ secrets.ALERT_EMAIL_FROM }}
-          ALERT_EMAIL_TO: ${{ secrets.ALERT_EMAIL_TO }}
-        run: python signal_watcher.py --test-alert
-
-      - name: Check three-pillar signals, learn outcomes and send notifications
-        if: github.event_name != 'workflow_dispatch' || inputs.test_alert != true
-        id: watcher
-        env:
+          TEST_ALERT: ${{ inputs.test_alert }}
           TWELVE_DATA_API_KEY: ${{ secrets.TWELVE_DATA_API_KEY }}
           MARKET_SYMBOL: XAU/USD
           BARS_PER_TIMEFRAME: "500"
@@ -86,7 +73,6 @@ jobs:
           ADAPTIVE_HORIZON_BARS: "12"
           ADAPTIVE_MAX_WEIGHT_CHANGE: "0.05"
           ALERT_MIN_CONFIDENCE: ${{ secrets.ALERT_MIN_CONFIDENCE }}
-          ALERT_FORMING_ENABLED: ${{ secrets.ALERT_FORMING_ENABLED }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
@@ -96,10 +82,17 @@ jobs:
           ALERT_EMAIL_FROM: ${{ secrets.ALERT_EMAIL_FROM }}
           ALERT_EMAIL_TO: ${{ secrets.ALERT_EMAIL_TO }}
           ALERT_STATE_PATH: data/alert_state.json
-        run: python signal_watcher.py
+          BURST_MAX_CHECKS: "4"
+          BURST_INTERVAL_SECONDS: "45"
+        run: |
+          if [ "$TEST_ALERT" = "true" ]; then
+            python signal_watcher.py --test-alert
+          else
+            python signal_watcher.py --burst
+          fi
 
       - name: Detect changed runtime state
-        if: github.event_name != 'workflow_dispatch' || inputs.test_alert != true
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.test_alert != true }}
         id: state
         run: |
           changed=false
@@ -108,8 +101,8 @@ jobs:
           fi
           echo "changed=$changed" >> "$GITHUB_OUTPUT"
 
-      - name: Save newest 24/7 learning state
-        if: (github.event_name != 'workflow_dispatch' || inputs.test_alert != true) && steps.state.outputs.changed == 'true'
+      - name: Save newest alert and learning state
+        if: ${{ steps.state.outputs.changed == 'true' }}
         uses: actions/cache/save@v4
         with:
           path: |
@@ -117,17 +110,14 @@ jobs:
             data/adaptive_state.json
           key: aurumedge-runtime-state-${{ github.run_id }}
 
-      - name: Daily durable brain backup to repository
-        if: github.event_name == 'schedule' && steps.state.outputs.changed == 'true'
+      - name: Daily durable brain backup
+        if: ${{ github.event_name == 'schedule' && steps.state.outputs.changed == 'true' }}
         continue-on-error: true
         run: |
-          # Cache carries learning between five-minute runs. Once near the end
-          # of each UTC day, also commit the brain file so it survives cache
-          # eviction and becomes available to the Streamlit deployment.
           hour=$(date -u +%H)
           minute=$(date -u +%M)
           if [ "$hour" != "23" ] || [ "$minute" -lt "55" ]; then
-            echo "Not the daily backup window; cache persistence is active."
+            echo "Outside the daily backup window; runtime cache remains active."
             exit 0
           fi
           git config user.name "AurumEdge Learning Bot"
