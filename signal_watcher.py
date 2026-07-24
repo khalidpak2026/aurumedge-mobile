@@ -5,11 +5,20 @@ import json
 import os
 from pathlib import Path
 
-import pandas as pd
 from dotenv import load_dotenv
 
 from gold_web_terminal.adaptive_engine import AdaptiveEngine, derive_feature_votes
-from gold_web_terminal.alerts import AlertConfig, AlertState, build_alert_events, dispatch_events, record_non_alert_states, send_test_alert
+from gold_web_terminal.alerts import (
+    AlertConfig,
+    AlertState,
+    build_alert_events,
+    dispatch_events,
+    record_non_alert_states,
+    send_test_alert,
+    is_primary_entry_live,
+    is_fvg_entry_live,
+)
+from gold_web_terminal.cloud_learning import CloudLearningCoordinator, derive_fvg_quality_votes
 from gold_web_terminal.config import Settings
 from gold_web_terminal.fvg_strategy import detect_four_hour_fvg_signal
 from gold_web_terminal.indicators import add_indicators, summarize_indicators
@@ -40,6 +49,27 @@ def risk_inputs(settings: Settings) -> RiskInputs:
     )
 
 
+def _resolve_path(raw: str) -> Path:
+    path = Path(raw)
+    return path if path.is_absolute() else APP_DIR / path
+
+
+def _text_or_empty(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8") if path.exists() else ""
+    except OSError:
+        return ""
+
+
+def _write_change_marker(path: Path, name: str, changed: bool) -> None:
+    marker = path.parent / name
+    if changed:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text("true", encoding="utf-8")
+    elif marker.exists():
+        marker.unlink()
+
+
 def run_once(dry_run: bool = False) -> dict:
     settings = Settings.from_env()
     if not settings.twelve_data_api_key:
@@ -52,9 +82,8 @@ def run_once(dry_run: bool = False) -> dict:
     indicators = [summarize_indicators(frames[tf], tf) for tf in TIMEFRAMES]
     liquidity = [analyze_liquidity(frames[tf], tf) for tf in ["M15", "H1", "H4", "D1"]]
 
-    adaptive_path = Path(settings.adaptive_state_path)
-    if not adaptive_path.is_absolute():
-        adaptive_path = APP_DIR / adaptive_path
+    adaptive_path = _resolve_path(settings.adaptive_state_path)
+    before_adaptive = _text_or_empty(adaptive_path)
     adaptive = AdaptiveEngine(
         adaptive_path,
         enabled=settings.adaptive_learning,
@@ -62,6 +91,14 @@ def run_once(dry_run: bool = False) -> dict:
         horizon_bars=settings.adaptive_horizon_bars,
         max_weight_change=settings.adaptive_max_weight_change,
     )
+    cloud_learning = CloudLearningCoordinator(adaptive)
+
+    # Review old signals before calculating the new decision.  Therefore each
+    # scheduled run immediately benefits from outcomes learned since the prior
+    # five-minute check.
+    completed = {"primary": [], "fvg": []}
+    if not dry_run:
+        completed = cloud_learning.review_all(frames)
     summary = adaptive.summary()
     risk = risk_inputs(settings)
 
@@ -80,13 +117,17 @@ def run_once(dry_run: bool = False) -> dict:
         macro_required_for_entry=False,
     )
     gold_h1 = frames["H1"][["time", "close"]].copy()
-    macro = fetch_macro_confirmation(
-        settings.twelve_data_api_key,
-        settings.dxy_symbol,
-        settings.us10y_symbol,
-        gold_h1,
-        preliminary.market_state,
-    ) if settings.macro_enabled else None
+    macro = (
+        fetch_macro_confirmation(
+            settings.twelve_data_api_key,
+            settings.dxy_symbol,
+            settings.us10y_symbol,
+            gold_h1,
+            preliminary.market_state,
+        )
+        if settings.macro_enabled
+        else None
+    )
 
     report = build_technical_report(
         symbol=bundle.symbol,
@@ -104,40 +145,79 @@ def run_once(dry_run: bool = False) -> dict:
         macro_required_for_entry=settings.macro_required_for_entry,
     )
     signal_time = frames["M15"].iloc[-1]["time"]
-    votes = derive_feature_votes(indicators, liquidity, macro, report.market_state)
-    report = adaptive.apply_capital_preservation(report, signal_time, votes)
+    primary_votes = derive_feature_votes(indicators, liquidity, macro, report.market_state)
+    report = adaptive.apply_capital_preservation(report, signal_time, primary_votes)
 
-    special = detect_four_hour_fvg_signal(
-        frames,
-        indicators=indicators,
-        macro=macro,
-        primary_state=report.market_state,
-        risk_inputs=risk,
-        digits=2,
-    ) if settings.h4_fvg_strategy_enabled else None
+    special = (
+        detect_four_hour_fvg_signal(
+            frames,
+            indicators=indicators,
+            macro=macro,
+            primary_state=report.market_state,
+            risk_inputs=risk,
+            digits=2,
+        )
+        if settings.h4_fvg_strategy_enabled
+        else None
+    )
+    fvg_votes: dict[str, int] = {}
     if special is not None:
+        fvg_votes = derive_fvg_quality_votes(
+            special,
+            indicators,
+            macro,
+            primary_votes,
+            current_price=report.last_price,
+        )
+        special = cloud_learning.apply_specialist_learning_gate(special, fvg_votes)
         report.special_signals = [special]
 
     config = AlertConfig.from_env()
-    state_path = Path(settings.alert_state_path)
-    if not state_path.is_absolute():
-        state_path = APP_DIR / state_path
-    state = AlertState(state_path)
-    before = state.path.read_text(encoding="utf-8") if state.path.exists() else ""
+    alert_state_path = _resolve_path(settings.alert_state_path)
+    before_alert = _text_or_empty(alert_state_path)
+    alert_state = AlertState(alert_state_path)
     events = build_alert_events(report, special)
+    primary_entry_live = is_primary_entry_live(report)
+    fvg_entry_live = is_fvg_entry_live(report, special)
+
     if dry_run:
         sent, errors = [], []
+        registered_primary = False
+        registered_fvg = False
     else:
-        sent, errors = dispatch_events(events, config, state)
-        record_non_alert_states(report, special, config, state)
-    after = state.path.read_text(encoding="utf-8") if state.path.exists() else ""
-    changed = before != after
-    marker = state.path.parent / ".alert_state_changed"
-    if changed:
-        marker.write_text("true", encoding="utf-8")
-    elif marker.exists():
-        marker.unlink()
+        sent, errors = dispatch_events(events, config, alert_state)
+        record_non_alert_states(report, special, config, alert_state)
 
+        # Register only executable signals.  On future runs they are evaluated
+        # against new M15 candles, then their outcomes update separate regular
+        # and FVG reliability statistics.
+        # Learn only from signals that were actually executable at the live
+        # price. Bias-only, WATCH/ARMED, stale, or already-missed setups are
+        # not recorded as trades.
+        primary_eligible = primary_entry_live and report.confidence >= config.minimum_confidence
+        fvg_eligible = fvg_entry_live and special is not None and special.confidence >= config.minimum_confidence
+        registered_primary = (
+            adaptive.register_signal(report, signal_time, primary_votes, timeframe="M15")
+            if primary_eligible else False
+        )
+        registered_fvg = (
+            cloud_learning.register_specialist_signal(
+                special, fvg_votes, symbol=report.symbol, timeframe="M15"
+            )
+            if fvg_eligible else False
+        )
+        # Persist schema migrations and the specialist-learning section even if
+        # this cycle did not create a new trade record.
+        adaptive.save()
+
+    after_alert = _text_or_empty(alert_state_path)
+    after_adaptive = _text_or_empty(adaptive_path)
+    alert_changed = before_alert != after_alert
+    adaptive_changed = before_adaptive != after_adaptive
+    _write_change_marker(alert_state_path, ".alert_state_changed", alert_changed)
+    _write_change_marker(adaptive_path, ".adaptive_state_changed", adaptive_changed)
+
+    specialist_counts = cloud_learning.specialist_counts()
     output = {
         "data_time": bundle.data_time,
         "price": report.last_price,
@@ -147,13 +227,26 @@ def run_once(dry_run: bool = False) -> dict:
         "special_side": special.side if special else "NONE",
         "special_confidence": special.confidence if special else 0,
         "events": [event.event_id for event in events],
+        "primary_entry_live": primary_entry_live,
+        "fvg_entry_live": fvg_entry_live,
         "sent": sent,
         "errors": errors,
         "alert_channels": {
             "telegram": config.telegram_enabled,
             "email": config.email_enabled,
         },
-        "state_changed": changed,
+        "learning": {
+            "primary_reviews_this_run": len(completed["primary"]),
+            "fvg_reviews_this_run": len(completed["fvg"]),
+            "primary_registered": registered_primary,
+            "fvg_registered": registered_fvg,
+            "primary_counts": adaptive.state.get("counts", {}),
+            "fvg_counts": specialist_counts,
+            "fvg_confidence_cap": cloud_learning.specialist_confidence_cap(),
+            "fvg_target_multipliers": cloud_learning.specialist_target_multipliers(),
+            "state_changed": adaptive_changed,
+        },
+        "alert_state_changed": alert_changed,
     }
     print(json.dumps(output, indent=2))
     return output
@@ -161,7 +254,7 @@ def run_once(dry_run: bool = False) -> dict:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="AurumEdge scheduled XAU/USD signal watcher")
-    parser.add_argument("--dry-run", action="store_true", help="Calculate signals but do not send alerts")
+    parser.add_argument("--dry-run", action="store_true", help="Calculate signals but do not send alerts or update learning")
     parser.add_argument("--test-alert", action="store_true", help="Send a test alert using configured channels")
     args = parser.parse_args()
     if args.test_alert:

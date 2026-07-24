@@ -14,7 +14,11 @@ import streamlit as st
 from dotenv import load_dotenv
 
 from gold_web_terminal.adaptive_engine import AdaptiveEngine, derive_feature_votes
-from gold_web_terminal.alerts import AlertConfig, AlertState, build_alert_events, dispatch_events, record_non_alert_states, send_test_alert
+from gold_web_terminal.alerts import (
+    AlertConfig, AlertState, build_alert_events, dispatch_events,
+    record_non_alert_states, send_test_alert, is_primary_entry_live,
+    is_fvg_entry_live,
+)
 from gold_web_terminal.ai_engine import research_gold_news, synthesize_ai_analysis
 from gold_web_terminal.config import Settings
 from gold_web_terminal.demo_data import generate_demo_bars
@@ -45,7 +49,7 @@ try:
 except Exception:
     pass
 
-BUILD_VERSION = "5.7.0-mobile-avwap-volume-profile"
+BUILD_VERSION = "5.7.4-mobile-primary-execution"
 TIMEFRAMES = ["M5", "M15", "H1", "H4", "D1"]
 TV_INTERVALS = {"M5": "5", "M15": "15", "H1": "60", "H4": "240", "D1": "D"}
 
@@ -227,7 +231,31 @@ def macro_cards(macro: MacroConfirmation) -> str:
 def signal_card(report: TechnicalReport, final_state: str, final_note: str) -> str:
     css_state = state_class(final_state)
     setup = report.active_setup if final_state in {"BUY", "SELL"} else None
-    if final_state == "TRAP":
+    edge = int(report.buy_score) - int(report.sell_score)
+    directional_bias = "BUY" if edge >= 20 else "SELL" if edge <= -20 else "NEUTRAL"
+    directional_setup = (
+        report.buy_setup if directional_bias == "BUY" else report.sell_setup if directional_bias == "SELL" else None
+    )
+    strong_directional_bias = directional_bias in {"BUY", "SELL"} and max(report.buy_score, report.sell_score) >= 75
+
+    if final_state in {"TRAP", "STUCK"} and strong_directional_bias and directional_setup is not None:
+        # Keep the directional regime visible even when the execution gate is
+        # temporarily waiting.  This avoids presenting a 93/7 sell stack as if
+        # the market had no direction, while still withholding an entry alert.
+        css_state = state_class(directional_bias)
+        title = f"{directional_bias} TREND · WAIT FOR ENTRY"
+        copy = (
+            f"Directional score {report.buy_score}/{report.sell_score}. "
+            f"Execution gate is {final_state}: {report.trap_reason or 'the live entry conditions are not ready.'}"
+        )
+        plan = f'''<div class="levels-grid">
+<div class="level-box wide"><span>Next qualified entry zone</span><strong>{fmt(directional_setup.entry_low)} – {fmt(directional_setup.entry_high)}</strong></div>
+<div class="level-box"><span>Stop loss</span><strong class="state-sell">{fmt(directional_setup.stop_loss)}</strong></div>
+<div class="level-box"><span>TP1</span><strong class="state-buy">{fmt(directional_setup.take_profit_1)}</strong></div>
+<div class="level-box"><span>TP2</span><strong class="state-buy">{fmt(directional_setup.take_profit_2)}</strong></div>
+<div class="level-box"><span>TP3</span><strong class="state-buy">{fmt(directional_setup.take_profit_3)}</strong></div>
+</div><div class="mobile-callout">No Telegram alert is sent until the live price reaches this zone and the current M15 candle confirms the direction.</div>'''
+    elif final_state == "TRAP":
         title = "LIQUIDITY / MACRO TRAP"
         copy = report.trap_reason or "Technical and macro evidence conflict. Do not force an entry."
         plan = '<div class="mobile-callout">Wait for a clean reclaim, rejection, or complete macro confirmation before entering.</div>'
@@ -248,7 +276,7 @@ def signal_card(report: TechnicalReport, final_state: str, final_note: str) -> s
                 f"{risk.status}: requested {risk.requested_lot:.2f} lot risks about ${risk.estimated_loss_requested_lot:,.2f}; "
                 f"recommended lot {risk.recommended_lot:.2f}; budget ${risk.risk_budget:,.2f}."
             )
-        title = f"ENTER {final_state}" if setup.status == "ENTER" else f"{final_state} BIAS · RISK BLOCK"
+        title = f"ENTER {final_state}" if setup.status == "ENTER" else f"{final_state} TREND · WAIT FOR ENTRY"
         copy = f"{report.regime.replace('_',' ').title()} · {escape(final_note)} · valid until {escape(setup.valid_until)}"
         plan = f'''<div class="levels-grid">
 <div class="level-box wide"><span>Entry zone</span><strong>{fmt(setup.entry_low)} – {fmt(setup.entry_high)}</strong></div>
@@ -260,10 +288,12 @@ def signal_card(report: TechnicalReport, final_state: str, final_note: str) -> s
     return f'''<div class="signal-shell"><div class="signal-overline">Current execution state</div><div class="signal-title state-{css_state}">{escape(title)}</div><div class="signal-copy">{escape(copy)}</div>{plan}</div>'''
 
 
-def special_strategy_card(signal) -> str:
+def special_strategy_card(signal, current_price: float | None = None) -> str:
     state = getattr(signal, "state", "NONE")
     side = getattr(signal, "side", "NONE")
-    state_tone = "state-buy" if state == "TRIGGERED" and side == "BUY" else "state-sell" if state == "TRIGGERED" and side == "SELL" else "state-stuck"
+    live = state == "TRIGGERED"
+    state_label = "ENTRY LIVE NOW" if live else "MISSED / EXPIRED" if state == "EXPIRED" else state
+    state_tone = "state-buy" if live and side == "BUY" else "state-sell" if live and side == "SELL" else "state-stuck"
     side_tone = "state-buy" if side == "BUY" else "state-sell" if side == "SELL" else "state-stuck"
 
     def fv(value):
@@ -273,7 +303,8 @@ def special_strategy_card(signal) -> str:
     if getattr(signal, "entry_low", None) is not None:
         levels = (
             '<div class="levels-grid">'
-            f'<div class="level-box wide"><span>FVG / entry</span><strong>{fv(signal.entry_low)} – {fv(signal.entry_high)}</strong></div>'
+            f'<div class="level-box wide"><span>Entry zone</span><strong>{fv(signal.entry_low)} – {fv(signal.entry_high)}</strong></div>'
+            f'<div class="level-box"><span>Live price</span><strong>{fv(current_price)}</strong></div>'
             f'<div class="level-box"><span>Stop loss</span><strong class="state-sell">{fv(signal.stop_loss)}</strong></div>'
             f'<div class="level-box"><span>TP1</span><strong class="state-buy">{fv(signal.take_profit_1)}</strong></div>'
             f'<div class="level-box"><span>TP2</span><strong class="state-buy">{fv(signal.take_profit_2)}</strong></div>'
@@ -285,12 +316,16 @@ def special_strategy_card(signal) -> str:
         for item in getattr(signal, "rationale", [])[:5]
     )
     agreement = "YES" if getattr(signal, "aligns_with_primary", False) else "NO"
+    instruction = (
+        "Entry price is live now. Do not chase after it leaves the zone." if live
+        else "No Telegram trade alert. WATCH/ARMED are preparation only; EXPIRED means the entry was missed."
+    )
     return (
         '<div class="signal-shell">'
         '<div class="signal-overline">Specialist strategy · 4H candle + M15 FVG</div>'
-        f'<div class="signal-title {side_tone}">{escape(side)} · <span class="{state_tone}">{escape(state)}</span></div>'
+        f'<div class="signal-title {side_tone}">{escape(side)} · <span class="{state_tone}">{escape(state_label)}</span></div>'
         f'<div class="signal-copy">Confidence {int(getattr(signal, "confidence", 0))}% · Regular engine agreement {agreement} · Macro {escape(str(getattr(signal, "macro_gate", "UNAVAILABLE")))}</div>'
-        f'{levels}{reasons}</div>'
+        f'<div class="mobile-callout">{escape(instruction)}</div>{levels}{reasons}</div>'
     )
 
 
@@ -534,6 +569,9 @@ four_hour_fvg = detect_four_hour_fvg_signal(
 if four_hour_fvg is not None:
     report.special_signals = [four_hour_fvg]
 
+primary_entry_live = is_primary_entry_live(report)
+fvg_entry_live = is_fvg_entry_live(report, four_hour_fvg)
+
 mobile_alert_messages: list[str] = []
 if bool(getattr(settings, "local_alerts_enabled", False)):
     alert_cfg = AlertConfig.from_env()
@@ -560,7 +598,7 @@ else:
     decision_memory["trap_age"] = 0
 decision_memory["state"] = report.market_state
 
-if report.market_state in {"BUY", "SELL"} and report.active_setup is not None:
+if primary_entry_live:
     adaptive.register_signal(report, signal_time, feature_votes, timeframe="M15")
 
 # Optional paid AI research remains manual. The adaptive technical/macro engine
@@ -580,6 +618,25 @@ if ai_review is not None:
     else:
         final_note = "Adaptive technical + macro + manual news"
 
+score_edge = int(report.buy_score) - int(report.sell_score)
+directional_bias = "BUY" if score_edge >= 15 else "SELL" if score_edge <= -15 else "NEUTRAL"
+if primary_entry_live:
+    decision_display = f"{report.market_state} ENTRY NOW"
+    decision_tone_state = report.market_state
+    execution_note = "Regular entry price is live; Telegram is eligible now."
+elif fvg_entry_live and four_hour_fvg is not None:
+    decision_display = f"FVG {four_hour_fvg.side} ENTRY NOW"
+    decision_tone_state = four_hour_fvg.side
+    execution_note = "Fresh first-touch FVG entry price is live; Telegram is eligible now."
+elif directional_bias in {"BUY", "SELL"}:
+    decision_display = f"{directional_bias} BIAS · WAIT"
+    decision_tone_state = directional_bias
+    execution_note = f"Execution gate: {final_state}. No alert until the live price reaches a qualified entry zone."
+else:
+    decision_display = final_state
+    decision_tone_state = final_state
+    execution_note = "No qualified directional edge or live entry zone."
+
 chart_liquidity = next((item for item in liquidity_snapshots if item.timeframe == chart_tf), None)
 if chart_liquidity is None:
     chart_liquidity = next((item for item in liquidity_snapshots if item.timeframe == "H1"), None)
@@ -587,14 +644,20 @@ if chart_liquidity is None:
 if completed_reviews:
     st.success(f"Adaptive brain reviewed {len(completed_reviews)} completed signal(s).")
 
-state_css = state_class(final_state)
+state_css = state_class(decision_tone_state)
 st.markdown(
     f'''<div class="mobile-kpis">
 <div class="mkpi"><span>Indicative price</span><strong>{fmt(report.last_price)}</strong><small>{escape(report.symbol)}</small></div>
-<div class="mkpi"><span>Decision</span><strong class="state-{state_css}">{escape(final_state)}</strong><small>{escape(final_note)}</small></div>
+<div class="mkpi"><span>Decision</span><strong class="state-{state_css}">{escape(decision_display)}</strong><small>{escape(final_note)}</small></div>
 <div class="mkpi"><span>Confidence</span><strong>{report.confidence}%</strong><small>Adaptive + macro quality</small></div>
 <div class="mkpi"><span>Buy / Sell score</span><strong>{report.buy_score} / {report.sell_score}</strong><small>{report.volatility_state.upper()} volatility</small></div>
 </div>''',
+    unsafe_allow_html=True,
+)
+st.markdown(
+    f'<div class="mobile-callout"><strong>Directional bias:</strong> {escape(directional_bias)} · '
+    f'<strong>Execution:</strong> {escape("ENTRY LIVE NOW" if (primary_entry_live or fvg_entry_live) else "WAIT")}<br>'
+    f'{escape(execution_note)}</div>',
     unsafe_allow_html=True,
 )
 
@@ -603,7 +666,7 @@ st.markdown(macro_cards(macro), unsafe_allow_html=True)
 st.markdown(signal_card(report, final_state, final_note), unsafe_allow_html=True)
 st.markdown('<div class="mobile-section">4H candle + M15 FVG strategy</div>', unsafe_allow_html=True)
 if four_hour_fvg is not None:
-    st.markdown(special_strategy_card(four_hour_fvg), unsafe_allow_html=True)
+    st.markdown(special_strategy_card(four_hour_fvg, report.last_price), unsafe_allow_html=True)
 for _msg in mobile_alert_messages:
     st.caption(_msg)
 
@@ -684,23 +747,23 @@ with macro_tab:
 with fvg_tab:
     st.markdown('<div class="mobile-section">4H displacement and fair-value-gap continuation</div>', unsafe_allow_html=True)
     if four_hour_fvg is not None:
-        st.markdown(special_strategy_card(four_hour_fvg), unsafe_allow_html=True)
+        st.markdown(special_strategy_card(four_hour_fvg, report.last_price), unsafe_allow_html=True)
         for item in four_hour_fvg.warnings:
             st.markdown(f'<div class="mobile-callout">• {escape(str(item))}</div>', unsafe_allow_html=True)
-    st.caption("WATCH = parent candle qualifies. ARMED = price is inside the FVG. TRIGGERED = an M15 confirmation candle has closed in the parent direction.")
+    st.caption("WATCH = valid setup waiting. ARMED = price is approaching. TRIGGERED = ENTRY LIVE NOW on a fresh first touch. EXPIRED = missed/consumed; no late alert.")
 
 with alerts_tab:
     st.markdown('<div class="mobile-section">Signal notifications</div>', unsafe_allow_html=True)
     cfg = AlertConfig.from_env()
     telegram_status = "READY" if cfg.telegram_enabled else "NOT SET"
     email_status = "READY" if cfg.email_enabled else "NOT SET"
-    forming_status = "ON" if cfg.forming_alerts else "OFF"
+    forming_status = "ENTRY ONLY"
     st.markdown(
         '<div class="brain-grid">'
         f'<div class="brain-card"><span>Telegram push</span><strong>{telegram_status}</strong><small>Best option for instant iPhone notification</small></div>'
         f'<div class="brain-card"><span>Email alerts</span><strong>{email_status}</strong><small>SMTP delivery</small></div>'
         f'<div class="brain-card"><span>Minimum confidence</span><strong>{cfg.minimum_confidence}%</strong><small>Lower-quality signals are not sent</small></div>'
-        f'<div class="brain-card"><span>Forming alerts</span><strong>{forming_status}</strong><small>ARMED FVG alerts; TRIGGERED is always eligible</small></div>'
+        f'<div class="brain-card"><span>Alert mode</span><strong>{forming_status}</strong><small>Only a live entry-zone arrival is sent</small></div>'
         '</div>',
         unsafe_allow_html=True,
     )
@@ -710,7 +773,7 @@ with alerts_tab:
             st.success("Test notification sent.")
         else:
             st.error("No channel configured or delivery failed: " + "; ".join(errors))
-    st.markdown('<div class="mobile-callout">For alerts while this app is closed, install the included GitHub Actions workflow. Streamlit auto-refresh only runs while a session is open.</div>', unsafe_allow_html=True)
+    st.markdown('<div class="mobile-callout">GitHub Actions monitors while the app is closed. Telegram is sent only when the current live price reaches a qualified entry zone; bias, WATCH, ARMED, TRAP and STUCK do not create trade alerts.</div>', unsafe_allow_html=True)
 
 with chart_tab:
     st.markdown('<div class="mobile-section">Professional market map</div>', unsafe_allow_html=True)
