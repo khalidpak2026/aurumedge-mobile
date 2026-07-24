@@ -17,17 +17,15 @@ from gold_web_terminal.adaptive_engine import AdaptiveEngine, derive_feature_vot
 from gold_web_terminal.alerts import (
     AlertConfig, AlertState, build_alert_events, dispatch_events,
     record_non_alert_states, send_test_alert, is_primary_entry_live,
-    is_fvg_entry_live,
 )
 from gold_web_terminal.ai_engine import research_gold_news, synthesize_ai_analysis
 from gold_web_terminal.config import Settings
 from gold_web_terminal.demo_data import generate_demo_bars
 from gold_web_terminal.indicators import add_indicators, summarize_indicators
-from gold_web_terminal.fvg_strategy import detect_four_hour_fvg_signal
 from gold_web_terminal.liquidity import analyze_liquidity
 from gold_web_terminal.macro_mobile_v542 import fetch_macro_confirmation, refresh_macro_confirmation
 from gold_web_terminal.market_data import MarketBundle, TwelveDataClient
-from gold_web_terminal.mobile_svg import mobile_macd_html, mobile_market_map_html, mobile_regime_html
+from gold_web_terminal.mobile_svg import mobile_market_map_html
 from gold_web_terminal.models import (
     AIAnalysis,
     MacroAssetSnapshot,
@@ -49,7 +47,7 @@ try:
 except Exception:
     pass
 
-BUILD_VERSION = "5.7.4-mobile-primary-execution"
+BUILD_VERSION = "5.8.0-mobile-three-pillar"
 TIMEFRAMES = ["M5", "M15", "H1", "H4", "D1"]
 TV_INTERVALS = {"M5": "5", "M15": "15", "H1": "60", "H4": "240", "D1": "D"}
 
@@ -192,7 +190,7 @@ def tradingview_widget(symbol: str, timeframe: str) -> None:
         "timezone": "Etc/UTC",
         "withdateranges": "1",
         "locale": "en",
-        "studies": "MACD@tv-basicstudies,RSI@tv-basicstudies,VWAP@tv-basicstudies",
+        "studies": "",
     }
     st.iframe("https://s.tradingview.com/widgetembed/?" + urlencode(params), width="stretch", height=610)
 
@@ -200,31 +198,27 @@ def tradingview_widget(symbol: str, timeframe: str) -> None:
 def timeframe_cards(snapshots: list[Any]) -> str:
     cards: list[str] = []
     for item in snapshots:
-        score = float(item.directional_score)
-        state = "BUY" if score >= 14 else "SELL" if score <= -14 else "NEUTRAL"
+        structure = 1 if item.market_structure in {"BOS_UP", "CHOCH_UP"} or item.structure_bias == "bullish" else -1 if item.market_structure in {"BOS_DOWN", "CHOCH_DOWN"} or item.structure_bias == "bearish" else 0
+        avwap = 1 if item.avwap_active is not None and item.close > item.avwap_active else -1 if item.avwap_active is not None and item.close < item.avwap_active else 0
+        profile = 1 if item.profile_acceptance == "bullish" or item.profile_state == "ABOVE_VALUE" else -1 if item.profile_acceptance == "bearish" or item.profile_state == "BELOW_VALUE" else 0
+        score = structure + avwap + profile
+        state = "BUY" if score >= 1 else "SELL" if score <= -1 else "NEUTRAL"
         tone = "state-buy" if state == "BUY" else "state-sell" if state == "SELL" else "state-stuck"
+        avwap_label = "ABOVE" if avwap > 0 else "BELOW" if avwap < 0 else "N/A"
         cards.append(
             f'<div class="tf-card"><div class="tf-head"><span>{escape(item.timeframe)}</span><span class="{tone}">{state}</span></div>'
-            f'<div class="tf-score {tone}">{score:+.0f}</div>'
-            f'<div class="tf-sub">RSI {fmt(item.rsi14,1)} · ADX {fmt(item.adx14,1)}<br>{escape(item.trend.title())} / {escape(item.momentum.title())}</div></div>'
+            f'<div class="tf-score {tone}">{score:+d}/3</div>'
+            f'<div class="tf-sub">STRUCT {escape(str(item.market_structure))}<br>AVWAP {avwap_label} · PROFILE {escape(str(item.profile_state))}</div></div>'
         )
     return '<div class="tf-grid">' + "".join(cards) + "</div>"
 
 
 def macro_cards(macro: MacroConfirmation) -> str:
     dxy_change = macro.dxy.change_4h if macro.dxy.change_4h is not None else macro.dxy.change_1d
-    dxy_period = "4h" if macro.dxy.change_4h is not None else "1d"
     y_change = macro.us10y.change_4h if macro.us10y.change_4h is not None else macro.us10y.change_1d
-    y_period = "4h" if macro.us10y.change_4h is not None else "1d"
-    gate_tone = "tone-good" if macro.gate == "CONFIRM" else "tone-bad" if macro.gate == "CONFLICT" else "tone-warn"
-    coverage_tone = "tone-good" if macro.coverage_score >= 100 else "tone-warn" if macro.coverage_score >= 80 else "tone-bad"
     return f'''<div class="macro-grid">
-<div class="macro-card"><span>DXY</span><strong class="{macro_tone(macro.dxy.direction)}">{fmt(macro.dxy.value,3)} {direction_arrow(macro.dxy.direction)}</strong><small>{dxy_period} {fmt(dxy_change,3)} · {escape(macro.dxy.source)}<br>{escape(macro.dxy.freshness)}</small></div>
-<div class="macro-card"><span>US 10Y yield</span><strong class="{macro_tone(macro.us10y.direction)}">{fmt(macro.us10y.value,3)}% {direction_arrow(macro.us10y.direction)}</strong><small>{y_period} {fmt(y_change,3)} · {escape(macro.us10y.source)}<br>{escape(macro.us10y.freshness)}</small></div>
-<div class="macro-card"><span>Gold 4H flow</span><strong class="{macro_tone(macro.gold_direction, True)}">{fmt(macro.gold_change_4h,2)} {direction_arrow(macro.gold_direction)}</strong><small>Calculated from the live H1 candle series</small></div>
-<div class="macro-card"><span>Decision gate</span><strong class="{gate_tone}">{escape(macro.gate)}</strong><small>{escape(macro.alignment)} · bias {escape(macro.macro_bias.replace('_',' '))}</small></div>
-<div class="macro-card"><span>Data coverage</span><strong class="{coverage_tone}">{macro.coverage_score}%</strong><small>{escape(macro.data_status)} · DXY + yield + gold flow</small></div>
-<div class="macro-card"><span>Macro score</span><strong>{macro.confirmation_score}/100</strong><small>Direction and agreement quality</small></div>
+<div class="macro-card"><span>DXY · context only</span><strong>{fmt(macro.dxy.value,3)} {direction_arrow(macro.dxy.direction)}</strong><small>{escape(macro.dxy.direction)} · change {fmt(dxy_change,3)} · does not block signals</small></div>
+<div class="macro-card"><span>US 10Y yield · context only</span><strong>{fmt(macro.us10y.value,3)}% {direction_arrow(macro.us10y.direction)}</strong><small>{escape(macro.us10y.direction)} · change {fmt(y_change,3)} · does not block signals</small></div>
 </div>'''
 
 
@@ -254,15 +248,15 @@ def signal_card(report: TechnicalReport, final_state: str, final_note: str) -> s
 <div class="level-box"><span>TP1</span><strong class="state-buy">{fmt(directional_setup.take_profit_1)}</strong></div>
 <div class="level-box"><span>TP2</span><strong class="state-buy">{fmt(directional_setup.take_profit_2)}</strong></div>
 <div class="level-box"><span>TP3</span><strong class="state-buy">{fmt(directional_setup.take_profit_3)}</strong></div>
-</div><div class="mobile-callout">No Telegram alert is sent until the live price reaches this zone and the current M15 candle confirms the direction.</div>'''
+</div><div class="mobile-callout">No Telegram alert is sent until live price reaches this zone while the three pillars remain aligned.</div>'''
     elif final_state == "TRAP":
         title = "LIQUIDITY / MACRO TRAP"
-        copy = report.trap_reason or "Technical and macro evidence conflict. Do not force an entry."
-        plan = '<div class="mobile-callout">Wait for a clean reclaim, rejection, or complete macro confirmation before entering.</div>'
+        copy = report.trap_reason or "The three active pillars conflict. Do not force an entry."
+        plan = '<div class="mobile-callout">Wait for structure, anchored VWAP and volume profile to realign.</div>'
     elif final_state == "STUCK":
         title = "MARKET STUCK"
         copy = report.trap_reason or "Directional evidence is incomplete or the market is compressed."
-        plan = '<div class="mobile-callout">No immediate trade. Refresh after a confirmed range break or after macro coverage improves.</div>'
+        plan = '<div class="mobile-callout">No immediate trade. Wait for a structure break or value acceptance.</div>'
     elif setup is None:
         title = f"{final_state} BIAS"
         copy = "Direction is visible, but no valid executable setup was produced."
@@ -276,7 +270,8 @@ def signal_card(report: TechnicalReport, final_state: str, final_note: str) -> s
                 f"{risk.status}: requested {risk.requested_lot:.2f} lot risks about ${risk.estimated_loss_requested_lot:,.2f}; "
                 f"recommended lot {risk.recommended_lot:.2f}; budget ${risk.risk_budget:,.2f}."
             )
-        title = f"ENTER {final_state}" if setup.status == "ENTER" else f"{final_state} TREND · WAIT FOR ENTRY"
+        entry_live = "ENTRY LIVE NOW" in report.signal_label
+        title = f"ENTER {final_state} · ENTRY LIVE NOW" if entry_live else f"{final_state} TREND · WAIT FOR ENTRY"
         copy = f"{report.regime.replace('_',' ').title()} · {escape(final_note)} · valid until {escape(setup.valid_until)}"
         plan = f'''<div class="levels-grid">
 <div class="level-box wide"><span>Entry zone</span><strong>{fmt(setup.entry_low)} – {fmt(setup.entry_high)}</strong></div>
@@ -354,7 +349,7 @@ except (TypeError, ValueError):
     auto_refresh_seconds = 1200
 feed_live = bool(settings.twelve_data_api_key)
 st.markdown(
-    f'<div class="mobile-header"><div class="mobile-brand"><div class="mobile-logo">Au</div><div><div class="mobile-title">AURUMEDGE ADAPTIVE MOBILE</div><div class="mobile-sub">XAU/USD · macro gate · adaptive brain · {BUILD_VERSION}</div></div></div><div class="mobile-live">{"LIVE FEED" if feed_live else "DEMO"}</div></div>',
+    f'<div class="mobile-header"><div class="mobile-brand"><div class="mobile-logo">Au</div><div><div class="mobile-title">AURUMEDGE ADAPTIVE MOBILE</div><div class="mobile-sub">XAU/USD · structure · anchored VWAP · volume profile · {BUILD_VERSION}</div></div></div><div class="mobile-live">{"LIVE FEED" if feed_live else "DEMO"}</div></div>',
     unsafe_allow_html=True,
 )
 
@@ -548,7 +543,7 @@ report = build_technical_report(
     adaptive_summary=adaptive_summary,
     risk_inputs=risk_inputs,
     macro=macro,
-    macro_required_for_entry=settings.macro_required_for_entry,
+    macro_required_for_entry=False,
     previous_state=decision_memory.get("state"),
     trap_anchor_price=decision_memory.get("trap_anchor_price"),
     trap_age=int(decision_memory.get("trap_age", 0)),
@@ -558,19 +553,11 @@ signal_time = frames["M15"].iloc[-1]["time"]
 feature_votes = derive_feature_votes(indicator_snapshots, liquidity_snapshots, macro, report.market_state)
 report = adaptive.apply_capital_preservation(report, signal_time, feature_votes)
 
-four_hour_fvg = detect_four_hour_fvg_signal(
-    frames,
-    indicators=indicator_snapshots,
-    macro=macro,
-    primary_state=report.market_state,
-    risk_inputs=risk_inputs,
-    digits=2,
-) if bool(getattr(settings, "h4_fvg_strategy_enabled", True)) else None
-if four_hour_fvg is not None:
-    report.special_signals = [four_hour_fvg]
+four_hour_fvg = None
+report.special_signals = []
 
 primary_entry_live = is_primary_entry_live(report)
-fvg_entry_live = is_fvg_entry_live(report, four_hour_fvg)
+fvg_entry_live = False
 
 mobile_alert_messages: list[str] = []
 if bool(getattr(settings, "local_alerts_enabled", False)):
@@ -580,9 +567,9 @@ if bool(getattr(settings, "local_alerts_enabled", False)):
         state_path = APP_DIR / state_path
     alert_state = AlertState(state_path)
     sent_ids, alert_errors = dispatch_events(
-        build_alert_events(report, four_hour_fvg), alert_cfg, alert_state
+        build_alert_events(report, None), alert_cfg, alert_state
     )
-    record_non_alert_states(report, four_hour_fvg, alert_cfg, alert_state)
+    record_non_alert_states(report, None, alert_cfg, alert_state)
     if sent_ids:
         mobile_alert_messages.append(f"Sent {len(sent_ids)} new alert(s).")
     mobile_alert_messages.extend(alert_errors)
@@ -601,22 +588,9 @@ decision_memory["state"] = report.market_state
 if primary_entry_live:
     adaptive.register_signal(report, signal_time, feature_votes, timeframe="M15")
 
-# Optional paid AI research remains manual. The adaptive technical/macro engine
-# owns prices, entries, stops and targets.
+# Optional research is informational only and never changes the three-pillar decision.
 final_state = report.market_state
-final_note = "All-timeframe M5→D1 + adaptive + DXY/US10Y gate"
-ai_review: AIAnalysis | None = st.session_state.get("mobile_ai_review")
-if ai_review is not None:
-    if report.market_state in {"STUCK", "TRAP"}:
-        final_state = report.market_state
-    elif ai_review.decision in {"STUCK", "TRAP"}:
-        final_state = ai_review.decision
-        final_note = "Manual news-risk gate"
-    elif ai_review.decision in {"BUY", "SELL"} and ai_review.decision != report.market_state:
-        final_state = "TRAP"
-        final_note = "Technical/macro/news conflict"
-    else:
-        final_note = "Adaptive technical + macro + manual news"
+final_note = "Market structure + Anchored VWAP + Volume Profile"
 
 score_edge = int(report.buy_score) - int(report.sell_score)
 directional_bias = "BUY" if score_edge >= 15 else "SELL" if score_edge <= -15 else "NEUTRAL"
@@ -624,10 +598,6 @@ if primary_entry_live:
     decision_display = f"{report.market_state} ENTRY NOW"
     decision_tone_state = report.market_state
     execution_note = "Regular entry price is live; Telegram is eligible now."
-elif fvg_entry_live and four_hour_fvg is not None:
-    decision_display = f"FVG {four_hour_fvg.side} ENTRY NOW"
-    decision_tone_state = four_hour_fvg.side
-    execution_note = "Fresh first-touch FVG entry price is live; Telegram is eligible now."
 elif directional_bias in {"BUY", "SELL"}:
     decision_display = f"{directional_bias} BIAS · WAIT"
     decision_tone_state = directional_bias
@@ -649,45 +619,39 @@ st.markdown(
     f'''<div class="mobile-kpis">
 <div class="mkpi"><span>Indicative price</span><strong>{fmt(report.last_price)}</strong><small>{escape(report.symbol)}</small></div>
 <div class="mkpi"><span>Decision</span><strong class="state-{state_css}">{escape(decision_display)}</strong><small>{escape(final_note)}</small></div>
-<div class="mkpi"><span>Confidence</span><strong>{report.confidence}%</strong><small>Adaptive + macro quality</small></div>
+<div class="mkpi"><span>Confidence</span><strong>{report.confidence}%</strong><small>Three-pillar quality</small></div>
 <div class="mkpi"><span>Buy / Sell score</span><strong>{report.buy_score} / {report.sell_score}</strong><small>{report.volatility_state.upper()} volatility</small></div>
 </div>''',
     unsafe_allow_html=True,
 )
 st.markdown(
     f'<div class="mobile-callout"><strong>Directional bias:</strong> {escape(directional_bias)} · '
-    f'<strong>Execution:</strong> {escape("ENTRY LIVE NOW" if (primary_entry_live or fvg_entry_live) else "WAIT")}<br>'
+    f'<strong>Execution:</strong> {escape("ENTRY LIVE NOW" if primary_entry_live else "WAIT")}<br>'
     f'{escape(execution_note)}</div>',
     unsafe_allow_html=True,
 )
 
-st.markdown('<div class="mobile-section">Macro confirmation</div>', unsafe_allow_html=True)
+st.markdown('<div class="mobile-section">DXY and yield direction · display only</div>', unsafe_allow_html=True)
 st.markdown(macro_cards(macro), unsafe_allow_html=True)
 st.markdown(signal_card(report, final_state, final_note), unsafe_allow_html=True)
-st.markdown('<div class="mobile-section">4H candle + M15 FVG strategy</div>', unsafe_allow_html=True)
-if four_hour_fvg is not None:
-    st.markdown(special_strategy_card(four_hour_fvg, report.last_price), unsafe_allow_html=True)
 for _msg in mobile_alert_messages:
     st.caption(_msg)
 
-tabs = st.tabs(["SIGNAL", "MACRO", "4H FVG", "ALERTS", "CHART", "LEVELS", "MOMENTUM", "BRAIN", "MORE"])
-signal_tab, macro_tab, fvg_tab, alerts_tab, chart_tab, levels_tab, momentum_tab, brain_tab, more_tab = tabs
+tabs = st.tabs(["SIGNAL", "CONTEXT", "ALERTS", "CHART", "LEVELS", "BRAIN", "MORE"])
+signal_tab, macro_tab, alerts_tab, chart_tab, levels_tab, brain_tab, more_tab = tabs
 
 with signal_tab:
     st.markdown('<div class="mobile-section">Multi-timeframe decision stack</div>', unsafe_allow_html=True)
-    st.markdown('<div class="mobile-callout">The final decision compares D1 regime, H4 trend, H1 structure, M15 confirmation and M5 timing. The selected chart does not change the decision.</div>', unsafe_allow_html=True)
+    st.markdown('<div class="mobile-callout">Every timeframe votes using only market structure, anchored VWAP and volume profile. M15/H1 time the entry; H4/D1 provide direction.</div>', unsafe_allow_html=True)
     st.markdown(timeframe_cards(indicator_snapshots), unsafe_allow_html=True)
     st.markdown('<div class="mobile-section">Why this decision</div>', unsafe_allow_html=True)
     reasons: list[str] = []
     if report.active_setup and final_state in {"BUY", "SELL"}:
         reasons.extend(report.active_setup.rationale)
-        if report.macro:
-            reasons.extend(report.macro.reasons[:3])
     elif report.trap_reason:
         reasons.append(report.trap_reason)
-        reasons.extend(report.macro.conflicts[:3] if report.macro else [])
     else:
-        reasons.append("Trend, momentum, liquidity, macro coverage and risk gates produced the current state.")
+        reasons.append("Market structure, anchored VWAP and volume profile produced the current state.")
     for reason in reasons[:9]:
         st.markdown(f'<div class="mobile-callout">• {escape(str(reason))}</div>', unsafe_allow_html=True)
 
@@ -706,51 +670,34 @@ with signal_tab:
             f"TP2: {setup.take_profit_2:,.2f}\n"
             f"TP3: {setup.take_profit_3:,.2f}\n"
             f"Confidence: {report.confidence}%\n"
-            f"Macro gate: {macro.gate} ({macro.coverage_score}% coverage)\n"
+            f"DXY: {macro.dxy.direction} · US10Y: {macro.us10y.direction} (context only)\n"
             f"{risk_line}\n"
             f"Invalidation: {setup.invalidation}"
         )
     else:
         summary = (
             f"XAU/USD {chart_tf} — {final_state}\nPrice: {report.last_price:,.2f}\n"
-            f"Confidence: {report.confidence}%\nMacro gate: {macro.gate} ({macro.coverage_score}% coverage)\nNo immediate entry."
+            f"Confidence: {report.confidence}%\nDXY: {macro.dxy.direction} · US10Y: {macro.us10y.direction} (context only)\nNo immediate entry."
         )
     st.markdown("**Shareable summary**")
     st.code(summary, language=None)
 
 with macro_tab:
-    if st.button("REFRESH MACRO", use_container_width=True, help="Forces a fresh DXY and yield lookup. Gold 4H is refreshed on every all-timeframe sync."):
+    if st.button("REFRESH DXY / YIELD", use_container_width=True, help="Refreshes context only. These assets never block a gold signal."):
         st.session_state["force_macro_refresh"] = True
         st.rerun()
     st.markdown(macro_cards(macro), unsafe_allow_html=True)
-    st.markdown('<div class="mobile-section">Confirmations</div>', unsafe_allow_html=True)
-    for item in macro.reasons or ["No confirming macro factor is currently available."]:
-        st.markdown(f'<div class="mobile-callout">• {escape(item)}</div>', unsafe_allow_html=True)
-    st.markdown('<div class="mobile-section">Conflicts and diagnostics</div>', unsafe_allow_html=True)
-    for item in (macro.conflicts + macro.notes) or ["No macro conflict or source warning is currently reported."]:
-        st.markdown(f'<div class="mobile-callout">• {escape(item)}</div>', unsafe_allow_html=True)
-    with st.expander("Macro source details"):
+    st.markdown('<div class="mobile-callout">DXY and US10Y are shown only as UP, DOWN, FLAT or UNAVAILABLE. The three-pillar engine does not use them to stop, reverse or reduce a BUY/SELL signal.</div>', unsafe_allow_html=True)
+    with st.expander("Source details"):
         st.json({
-            "coverage_score": macro.coverage_score,
-            "data_status": macro.data_status,
-            "alignment": macro.alignment,
-            "gate": macro.gate,
+            "dxy_direction": macro.dxy.direction,
             "dxy_source": macro.dxy.source,
             "dxy_time": macro.dxy.data_time,
-            "dxy_freshness": macro.dxy.freshness,
+            "us10y_direction": macro.us10y.direction,
             "us10y_source": macro.us10y.source,
             "us10y_time": macro.us10y.data_time,
-            "us10y_freshness": macro.us10y.freshness,
-            "gold_change_4h": macro.gold_change_4h,
+            "signal_gate": "DISABLED",
         })
-
-with fvg_tab:
-    st.markdown('<div class="mobile-section">4H displacement and fair-value-gap continuation</div>', unsafe_allow_html=True)
-    if four_hour_fvg is not None:
-        st.markdown(special_strategy_card(four_hour_fvg, report.last_price), unsafe_allow_html=True)
-        for item in four_hour_fvg.warnings:
-            st.markdown(f'<div class="mobile-callout">• {escape(str(item))}</div>', unsafe_allow_html=True)
-    st.caption("WATCH = valid setup waiting. ARMED = price is approaching. TRIGGERED = ENTRY LIVE NOW on a fresh first touch. EXPIRED = missed/consumed; no late alert.")
 
 with alerts_tab:
     st.markdown('<div class="mobile-section">Signal notifications</div>', unsafe_allow_html=True)
@@ -773,7 +720,7 @@ with alerts_tab:
             st.success("Test notification sent.")
         else:
             st.error("No channel configured or delivery failed: " + "; ".join(errors))
-    st.markdown('<div class="mobile-callout">GitHub Actions monitors while the app is closed. Telegram is sent only when the current live price reaches a qualified entry zone; bias, WATCH, ARMED, TRAP and STUCK do not create trade alerts.</div>', unsafe_allow_html=True)
+    st.markdown('<div class="mobile-callout">GitHub Actions monitors while the app is closed. Telegram is sent only when the current live price reaches a qualified entry zone; bias and STUCK states do not create trade alerts. FVG alerts are disabled in this build.</div>', unsafe_allow_html=True)
 
 with chart_tab:
     st.markdown('<div class="mobile-section">Professional market map</div>', unsafe_allow_html=True)
@@ -784,7 +731,7 @@ with chart_tab:
         ),
         unsafe_allow_html=True,
     )
-    st.caption("Safari-safe chart with market structure, anchored VWAP, volume profile, secondary EMA context, support/resistance, liquidity and active setup levels.")
+    st.caption("Safari-safe chart using only market structure, anchored VWAP, volume profile and active setup levels.")
 
 with levels_tab:
     st.markdown('<div class="mobile-section">Nearest price levels</div>', unsafe_allow_html=True)
@@ -815,27 +762,6 @@ with levels_tab:
             st.write("**Supply zones**")
             st.dataframe(pd.DataFrame(item.resistance_zones), hide_index=True, width="stretch")
 
-with momentum_tab:
-    st.markdown('<div class="mobile-section">Directional strength</div>', unsafe_allow_html=True)
-    st.markdown(mobile_regime_html(indicator_snapshots), unsafe_allow_html=True)
-    st.markdown(f'<div class="mobile-section">{chart_tf} MACD</div>', unsafe_allow_html=True)
-    st.markdown(mobile_macd_html(frames[chart_tf], chart_tf), unsafe_allow_html=True)
-    rows = []
-    for item in indicator_snapshots:
-        rows.append({
-            "TF": item.timeframe,
-            "Trend": item.trend.upper(),
-            "RSI": round(float(item.rsi14 or 0), 1),
-            "ADX": round(float(item.adx14 or 0), 1),
-            "ATR%": round(float(item.atr_pct or 0), 2),
-            "MACD H": round(float(item.macd_hist or 0), 2),
-            "Structure": item.market_structure,
-            "AVWAP": round(float(item.avwap_active or 0), 2),
-            "Profile": item.profile_state,
-            "POC": round(float(item.profile_poc or 0), 2),
-        })
-    st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
-
 with brain_tab:
     summary = adaptive.summary()
     st.markdown(f'''<div class="brain-grid">
@@ -845,7 +771,8 @@ with brain_tab:
 <div class="brain-card"><span>Learning mode</span><strong>{'ACTIVE' if summary.enabled else 'OFF'}</strong><small>Confidence cap {adaptive.confidence_cap()}% · full learning near {settings.adaptive_min_samples} samples</small></div>
 </div>''', unsafe_allow_html=True)
     st.markdown(f'<div class="mobile-callout"><strong>Latest review</strong><br>{escape(summary.last_review)}</div>', unsafe_allow_html=True)
-    weight_rows = [{"Feature": k.replace("_", " ").title(), "Weight": round(v, 3), "Samples": summary.indicator_samples.get(k, 0)} for k, v in summary.indicator_weights.items()]
+    active_features = {"market_structure", "anchored_vwap", "volume_profile", "entry_quality"}
+    weight_rows = [{"Feature": k.replace("_", " ").title(), "Weight": round(v, 3), "Samples": summary.indicator_samples.get(k, 0)} for k, v in summary.indicator_weights.items() if k in active_features]
     st.dataframe(pd.DataFrame(weight_rows), hide_index=True, width="stretch")
     st.caption("Streamlit Cloud storage can reset after redeployment. Download an adaptive-state backup periodically.")
     try:
@@ -868,7 +795,7 @@ with brain_tab:
 
 with more_tab:
     st.markdown('<div class="mobile-section">Optional paid AI research</div>', unsafe_allow_html=True)
-    st.markdown('<div class="mobile-callout">OpenAI web research is manual and off by default. DXY, US10Y, Gold 4H, adaptive learning and technical analysis work without it.</div>', unsafe_allow_html=True)
+    st.markdown('<div class="mobile-callout">OpenAI research is informational only. It cannot override the market-structure, anchored-VWAP and volume-profile signal.</div>', unsafe_allow_html=True)
     can_ai = settings.openai_api_key.startswith("sk-") and bundle.source != "DEMO"
     if st.button("RUN PAID AI RESEARCH", disabled=not can_ai, use_container_width=True):
         try:
@@ -877,7 +804,7 @@ with more_tab:
                 ai_dict = cached_synthesis(settings.openai_api_key, settings.openai_model, report.model_dump_json(), research["text"])
                 st.session_state["mobile_ai_review"] = AIAnalysis.model_validate(ai_dict)
                 st.session_state["mobile_research_text"] = research["text"]
-                st.success("AI research completed. Refresh once to apply the manual news gate.")
+                st.success("AI research completed for information only; the technical signal is unchanged.")
         except Exception as exc:
             st.error(f"AI research failed: {exc}")
     if st.session_state.get("mobile_research_text"):
@@ -899,18 +826,19 @@ with more_tab:
             "auto_refresh_seconds": auto_refresh_seconds,
             "all_timeframes_compared": TIMEFRAMES,
             "last_refresh_reason": st.session_state.get("last_refresh_reason", "Initial synchronization"),
-            "macro_gate": macro.gate,
-            "macro_coverage": macro.coverage_score,
+            "decision_engine": "MARKET_STRUCTURE + ANCHORED_VWAP + VOLUME_PROFILE",
+            "dxy_direction": macro.dxy.direction,
+            "us10y_direction": macro.us10y.direction,
+            "macro_signal_gate": False,
             "dxy_source": macro.dxy.source,
             "us10y_source": macro.us10y.source,
             "gold_4h_move": macro.gold_change_4h,
             "adaptive_reviewed_signals": adaptive.summary().reviewed_signals,
-            "h4_fvg_state": four_hour_fvg.state if four_hour_fvg else "DISABLED",
-            "h4_fvg_side": four_hour_fvg.side if four_hour_fvg else "NONE",
+            "fvg_signals": "DISABLED",
             "risk_status": rp.status if rp else "NO_SETUP",
             "recommended_lot": rp.recommended_lot if rp else None,
             "broker_connected": False,
             "order_execution": False,
         })
 
-st.markdown(f'<div class="mobile-footer">AurumEdge Adaptive Mobile · {BUILD_VERSION} · All-timeframe sync · No broker connection · No automatic execution</div>', unsafe_allow_html=True)
+st.markdown(f'<div class="mobile-footer">AurumEdge Three-Pillar Mobile · {BUILD_VERSION} · All-timeframe sync · No broker connection · No automatic execution</div>', unsafe_allow_html=True)
