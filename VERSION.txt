@@ -1,1 +1,1 @@
-5.8.0-mobile-three-pillar
+5.8.1-mobile-entry-lifecycle
