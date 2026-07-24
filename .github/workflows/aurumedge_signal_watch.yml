@@ -9,13 +9,12 @@ on:
         default: false
         type: boolean
   schedule:
-    # Five-minute checks during the main Monday-Friday UTC sessions.
-    - cron: "2-57/5 * * * 1-5"
-    # Gold commonly reopens late Sunday UTC; include the first two hours.
-    - cron: "2-57/5 22-23 * * 0"
+    # 24/7 cloud checks every five minutes. Closed-market runs normally see no
+    # new candle and therefore do not register a duplicate signal.
+    - cron: "2-57/5 * * * *"
 
 permissions:
-  contents: read
+  contents: write
 
 defaults:
   run:
@@ -27,10 +26,13 @@ jobs:
     timeout-minutes: 8
     concurrency:
       group: aurumedge-signal-watch
-      cancel-in-progress: true
+      cancel-in-progress: false
+
     steps:
       - name: Check out terminal
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -42,13 +44,15 @@ jobs:
       - name: Install watcher dependencies
         run: python -m pip install --upgrade pip && pip install -r requirements-alerts.txt
 
-      - name: Restore alert deduplication state
+      - name: Restore 24/7 alert and learning state
         uses: actions/cache/restore@v4
         with:
-          path: data/alert_state.json
-          key: aurumedge-alert-state-${{ github.run_id }}
+          path: |
+            data/alert_state.json
+            data/adaptive_state.json
+          key: aurumedge-runtime-state-${{ github.run_id }}
           restore-keys: |
-            aurumedge-alert-state-
+            aurumedge-runtime-state-
 
       - name: Send test notification
         if: github.event_name == 'workflow_dispatch' && inputs.test_alert == true
@@ -63,7 +67,7 @@ jobs:
           ALERT_EMAIL_TO: ${{ secrets.ALERT_EMAIL_TO }}
         run: python signal_watcher.py --test-alert
 
-      - name: Check signals and send notifications
+      - name: Check three-pillar signals, learn outcomes and send notifications
         if: github.event_name != 'workflow_dispatch' || inputs.test_alert != true
         id: watcher
         env:
@@ -74,8 +78,13 @@ jobs:
           PROVIDER_DAILY_LIMIT: "800"
           CLOUD_WATCHER_MINUTES: "5"
           MACRO_ENABLED: "true"
-          MACRO_REQUIRED_FOR_ENTRY: "true"
-          H4_FVG_STRATEGY_ENABLED: "true"
+          MACRO_REQUIRED_FOR_ENTRY: "false"
+          H4_FVG_STRATEGY_ENABLED: "false"
+          ADAPTIVE_LEARNING: "true"
+          ADAPTIVE_STATE_PATH: data/adaptive_state.json
+          ADAPTIVE_MIN_SAMPLES: "20"
+          ADAPTIVE_HORIZON_BARS: "12"
+          ADAPTIVE_MAX_WEIGHT_CHANGE: "0.05"
           ALERT_MIN_CONFIDENCE: ${{ secrets.ALERT_MIN_CONFIDENCE }}
           ALERT_FORMING_ENABLED: ${{ secrets.ALERT_FORMING_ENABLED }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -89,19 +98,45 @@ jobs:
           ALERT_STATE_PATH: data/alert_state.json
         run: python signal_watcher.py
 
-      - name: Detect changed alert state
+      - name: Detect changed runtime state
         if: github.event_name != 'workflow_dispatch' || inputs.test_alert != true
         id: state
         run: |
-          if [ -f data/.alert_state_changed ]; then
-            echo "changed=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "changed=false" >> "$GITHUB_OUTPUT"
+          changed=false
+          if [ -f data/.alert_state_changed ] || [ -f data/.adaptive_state_changed ]; then
+            changed=true
           fi
+          echo "changed=$changed" >> "$GITHUB_OUTPUT"
 
-      - name: Save alert deduplication state
+      - name: Save newest 24/7 learning state
         if: (github.event_name != 'workflow_dispatch' || inputs.test_alert != true) && steps.state.outputs.changed == 'true'
         uses: actions/cache/save@v4
         with:
-          path: data/alert_state.json
-          key: aurumedge-alert-state-${{ github.run_id }}
+          path: |
+            data/alert_state.json
+            data/adaptive_state.json
+          key: aurumedge-runtime-state-${{ github.run_id }}
+
+      - name: Daily durable brain backup to repository
+        if: github.event_name == 'schedule' && steps.state.outputs.changed == 'true'
+        continue-on-error: true
+        run: |
+          # Cache carries learning between five-minute runs. Once near the end
+          # of each UTC day, also commit the brain file so it survives cache
+          # eviction and becomes available to the Streamlit deployment.
+          hour=$(date -u +%H)
+          minute=$(date -u +%M)
+          if [ "$hour" != "23" ] || [ "$minute" -lt "55" ]; then
+            echo "Not the daily backup window; cache persistence is active."
+            exit 0
+          fi
+          git config user.name "AurumEdge Learning Bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add data/adaptive_state.json
+          if git diff --cached --quiet; then
+            echo "No adaptive-state changes to commit."
+            exit 0
+          fi
+          git commit -m "Update adaptive learning state [skip ci]"
+          git pull --rebase origin main
+          git push origin HEAD:main
