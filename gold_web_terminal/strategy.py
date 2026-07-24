@@ -158,6 +158,56 @@ def _market_stats(indicators: list[IndicatorSnapshot]) -> dict[str, float | int 
     }
 
 
+def _timeframe_alignment(indicators: list[IndicatorSnapshot]) -> dict[str, int]:
+    """Count directional agreement once per important timeframe.
+
+    The old engine could let one fresh liquidity sweep overrule four aligned
+    timeframes.  This helper deliberately evaluates the *stack* first.  It is
+    not a signal by itself; it is used to decide whether a sweep is a genuine
+    reversal warning or only a temporary event inside an established trend.
+    """
+
+    bullish = 0
+    bearish = 0
+    neutral = 0
+    for timeframe in ("M15", "H1", "H4", "D1"):
+        item = next((row for row in indicators if row.timeframe == timeframe), None)
+        if item is None:
+            continue
+
+        bull_votes = 0
+        bear_votes = 0
+        if item.trend == "bullish":
+            bull_votes += 2
+        elif item.trend == "bearish":
+            bear_votes += 2
+        if item.structure_bias == "bullish" or item.market_structure in {"BOS_UP", "CHOCH_UP"}:
+            bull_votes += 2
+        elif item.structure_bias == "bearish" or item.market_structure in {"BOS_DOWN", "CHOCH_DOWN"}:
+            bear_votes += 2
+        if item.momentum == "bullish":
+            bull_votes += 1
+        elif item.momentum == "bearish":
+            bear_votes += 1
+        if item.directional_score >= 12:
+            bull_votes += 1
+        elif item.directional_score <= -12:
+            bear_votes += 1
+        if item.avwap_active is not None:
+            if item.close > item.avwap_active:
+                bull_votes += 1
+            elif item.close < item.avwap_active:
+                bear_votes += 1
+
+        if bull_votes >= bear_votes + 2:
+            bullish += 1
+        elif bear_votes >= bull_votes + 2:
+            bearish += 1
+        else:
+            neutral += 1
+    return {"bullish": bullish, "bearish": bearish, "neutral": neutral}
+
+
 def _liquidity_context(liquidity: list[LiquiditySnapshot], price: float) -> dict[str, Any]:
     supports: list[float] = []
     resistances: list[float] = []
@@ -484,6 +534,9 @@ def build_technical_report(
     average_adx = float(stats["average_adx"])
     average_chop = float(stats["average_chop"])
     compression_count = int(stats["compressions"])
+    alignment = _timeframe_alignment(indicators)
+    bullish_tf_count = int(alignment["bullish"])
+    bearish_tf_count = int(alignment["bearish"])
     breakout_up = bool(stats["breakout_up"] and (m15.profile_acceptance == "bullish" or m15.profile_state == "ABOVE_VALUE" or m15.close > float(m15.profile_poc or m15.close)))
     breakout_down = bool(stats["breakout_down"] and (m15.profile_acceptance == "bearish" or m15.profile_state == "BELOW_VALUE" or m15.close < float(m15.profile_poc or m15.close)))
     net = bullish - bearish
@@ -523,6 +576,36 @@ def build_technical_report(
 
     fast_break_up = bool(breakout_up or m15.structure_break_up)
     fast_break_down = bool(breakout_down or m15.structure_break_down)
+
+    m15_above_value = m15.close > float(m15.avwap_active or m15.profile_poc or m15.vwap or m15.ema20 or m15.close)
+    m15_below_value = m15.close < float(m15.avwap_active or m15.profile_poc or m15.vwap or m15.ema20 or m15.close)
+    bullish_reversal_evidence = bool(
+        fast_break_up
+        and (m15_bull_impulse or m15.momentum == "bullish")
+        and (m15_above_value or m15.market_structure == "CHOCH_UP")
+    )
+    bearish_reversal_evidence = bool(
+        fast_break_down
+        and (m15_bear_impulse or m15.momentum == "bearish")
+        and (m15_below_value or m15.market_structure == "CHOCH_DOWN")
+    )
+
+    strong_bull_stack = bool(
+        bullish_tf_count >= 3
+        and bearish_tf_count <= 1
+        and h1.trend == "bullish"
+        and h4.trend in {"bullish", "neutral"}
+        and net >= 18
+        and average_adx >= 22
+    )
+    strong_bear_stack = bool(
+        bearish_tf_count >= 3
+        and bullish_tf_count <= 1
+        and h1.trend == "bearish"
+        and h4.trend in {"bearish", "neutral"}
+        and net <= -18
+        and average_adx >= 22
+    )
     bullish_resolution = bool(
         m15_bull_impulse
         and fast_break_up
@@ -559,6 +642,23 @@ def build_technical_report(
         )
     )
 
+    # A strong multi-timeframe trend should remain a directional regime while
+    # the engine waits for a safe entry.  A sweep alone is not enough to convert
+    # four aligned bearish/bullish timeframes into TRAP.  The opposite side must
+    # also produce a real M15 structure reversal.
+    if strong_bull_stack and not bearish_reversal_evidence:
+        bullish_confirmation = True
+        bearish_confirmation = False
+        buy_reasons.append(
+            f"{bullish_tf_count}/4 key timeframes are bullish with strong ADX; the trend stack overrides an unconfirmed sweep."
+        )
+    elif strong_bear_stack and not bullish_reversal_evidence:
+        bearish_confirmation = True
+        bullish_confirmation = False
+        sell_reasons.append(
+            f"{bearish_tf_count}/4 key timeframes are bearish with strong ADX; the trend stack overrides an unconfirmed sweep."
+        )
+
     bull_trap_levels: dict[str, float] = liq.get("bull_trap_levels", {})
     bear_trap_levels: dict[str, float] = liq.get("bear_trap_levels", {})
     bull_trap_near = any(abs(price - level) <= h1_atr * 0.45 for level in bull_trap_levels.values())
@@ -570,8 +670,18 @@ def build_technical_report(
     # move is directly contradicted.  A confirmed directional impulse always
     # overrides the trap label.
     liquidity_conflict = bool(
-        (bull_trap_near and bullish_confirmation and not bearish_resolution and not bullish_resolution)
-        or (bear_trap_near and bearish_confirmation and not bullish_resolution and not bearish_resolution)
+        (
+            bull_trap_near
+            and bullish_confirmation
+            and bearish_reversal_evidence
+            and not bullish_resolution
+        )
+        or (
+            bear_trap_near
+            and bearish_confirmation
+            and bullish_reversal_evidence
+            and not bearish_resolution
+        )
     )
     unresolved_two_sided = bool(
         two_sided_fresh
@@ -718,7 +828,12 @@ def build_technical_report(
             regime = "stuck_range"
             signal_label = "NO TRADE · MACRO CONFLICT"
         elif macro.gate == "NEUTRAL" and macro_required_for_entry:
-            if abs(net) < 38 or average_adx < 27 or not technical_alignment:
+            strong_stack = strong_bull_stack if market_state == "BUY" else strong_bear_stack
+            # Mixed DXY/yield data should reduce confidence, not erase a clear
+            # 3-to-4 timeframe trend.  It still blocks weak or poorly aligned
+            # entries, but no longer turns an obvious 93/7 directional stack
+            # into STUCK merely because macro is neutral.
+            if (not strong_stack) and (abs(net) < 30 or average_adx < 24 or not technical_alignment):
                 trap_reason = "DXY and yield are mixed; technical strength is not exceptional enough to justify execution."
                 market_state = "STUCK"
                 regime = "stuck_range"
@@ -757,6 +872,24 @@ def build_technical_report(
             signal_label += " · REDUCE LOT"
         elif active_setup.risk_plan.status == "NO_TRADE":
             signal_label = f"{market_state} BIAS · RISK TOO HIGH"
+
+    # The terminal now separates directional regime from execution timing.
+    # BUY/SELL can remain visible instead of falling back to TRAP/STUCK, while
+    # Telegram remains silent until the current live price reaches the entry.
+    if active_setup is not None and active_setup.status == "ENTER":
+        entry_tolerance = max(0.12 * m15_atr, 0.25)
+        entry_live = (
+            active_setup.entry_low - entry_tolerance
+            <= price
+            <= active_setup.entry_high + entry_tolerance
+        )
+        if entry_live:
+            signal_label = f"{signal_label} · ENTRY LIVE NOW"
+        else:
+            signal_label = f"{signal_label} · WAIT FOR ENTRY ZONE"
+            active_setup.warnings.append(
+                "Directional setup is active, but no alert is sent until the live price reaches the displayed entry zone."
+            )
 
     notes = [
         "The decision engine prioritizes multi-timeframe market structure, anchored VWAP and volume-profile acceptance, then confirms with momentum, DMI/ADX, ATR, liquidity and the DXY/US10Y/gold-flow execution gate.",
