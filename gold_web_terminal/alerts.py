@@ -131,7 +131,7 @@ def _m15_atr(report: TechnicalReport) -> float:
 
 
 def _inside_live_zone(price: float, low: float, high: float, atr: float) -> bool:
-    tolerance = max(0.10 * atr, 0.25)
+    tolerance = max(0.20 * atr, 0.35)
     return float(low) - tolerance <= float(price) <= float(high) + tolerance
 
 
@@ -168,11 +168,24 @@ def is_fvg_entry_live(report: TechnicalReport, special: FourHourFVGSignal | None
 def _macro_line(report: TechnicalReport) -> str:
     macro = report.macro
     if macro is None:
-        return "Macro: unavailable"
-    dxy = "—" if macro.dxy.value is None else f"{macro.dxy.value:.3f} {macro.dxy.direction}"
-    yld = "—" if macro.us10y.value is None else f"{macro.us10y.value:.3f}% {macro.us10y.direction}"
-    gold4 = "—" if macro.gold_change_4h is None else f"{macro.gold_change_4h:+.2f} {macro.gold_direction}"
-    return f"DXY {dxy} | US10Y {yld} | Gold 4H {gold4} | gate {macro.gate}"
+        return "DXY/US10Y context: unavailable (not a signal gate)"
+    dxy = macro.dxy.direction
+    yld = macro.us10y.direction
+    return f"Context only — DXY {dxy} | US10Y {yld}; neither can block this signal"
+
+
+def _pillar_line(report: TechnicalReport) -> str:
+    rows = {item.timeframe: item for item in report.indicators}
+    parts: list[str] = []
+    for tf in ("M15", "H1", "H4"):
+        item = rows.get(tf)
+        if item is None:
+            continue
+        structure = item.structure_bias.upper()
+        avwap = "ABOVE" if item.avwap_active is not None and item.close > item.avwap_active else "BELOW" if item.avwap_active is not None else "N/A"
+        profile = item.profile_state
+        parts.append(f"{tf}: structure {structure}, AVWAP {avwap}, profile {profile}")
+    return " | ".join(parts)
 
 
 def _setup_lines(report: TechnicalReport) -> list[str]:
@@ -187,65 +200,37 @@ def _setup_lines(report: TechnicalReport) -> list[str]:
     ]
 
 
-def build_alert_events(report: TechnicalReport, special: FourHourFVGSignal | None) -> list[AlertEvent]:
-    """Build only immediately executable, live-price entry alerts.
-
-    No WATCH, ARMED, historical TRIGGERED, bias-only, or already-missed setup is
-    eligible. This is deliberately redundant with the strategy state so a
-    stale detector can never send a late price alert.
-    """
+def build_alert_events(report: TechnicalReport, special: FourHourFVGSignal | None = None) -> list[AlertEvent]:
+    """Send only live primary entries from the three-pillar engine."""
+    del special
     events: list[AlertEvent] = []
     candle_time = next((item.timestamp for item in report.indicators if item.timeframe == "M15"), report.data_time)
-
-    if is_primary_entry_live(report):
-        setup = report.active_setup
-        assert setup is not None
-        setup_key = f"{report.market_state}|{setup.entry_low:.2f}|{setup.entry_high:.2f}|{setup.stop_loss:.2f}"
-        event_id = f"PRIMARY_ENTRY|{setup_key}|{candle_time}"
-        lines = [
-            "ENTRY PRICE HAS ARRIVED",
-            f"XAU/USD live {report.last_price:.2f} | {report.market_state} | confidence {report.confidence}%",
-            *_setup_lines(report),
-            _macro_line(report),
-            "Valid only while the live broker price remains inside/next to this entry zone.",
-            "Do not chase if price has already left the zone.",
-        ]
-        events.append(
-            AlertEvent(
-                event_id,
-                f"XAU/USD {report.market_state} — ENTRY LIVE NOW",
-                "\n".join(lines),
-                "PRIMARY_ENTRY_LIVE",
-                report.confidence,
-                transition_key="primary_entry_live",
-                transition_value=setup_key,
-            )
+    if not is_primary_entry_live(report):
+        return events
+    setup = report.active_setup
+    assert setup is not None
+    setup_key = f"{report.market_state}|{setup.entry_low:.2f}|{setup.entry_high:.2f}|{setup.stop_loss:.2f}"
+    event_id = f"THREE_PILLAR_ENTRY|{setup_key}|{candle_time}"
+    lines = [
+        "ENTRY PRICE HAS ARRIVED",
+        f"XAU/USD live {report.last_price:.2f} | {report.market_state} | confidence {report.confidence}%",
+        *_setup_lines(report),
+        _pillar_line(report),
+        _macro_line(report),
+        "Signal basis: market structure + anchored VWAP + volume profile only.",
+        "Valid only while live price remains inside/next to this entry zone. Do not chase later.",
+    ]
+    events.append(
+        AlertEvent(
+            event_id,
+            f"XAU/USD {report.market_state} — ENTRY LIVE NOW",
+            "\n".join(lines),
+            "THREE_PILLAR_ENTRY_LIVE",
+            report.confidence,
+            transition_key="primary_entry_live",
+            transition_value=setup_key,
         )
-
-    if is_fvg_entry_live(report, special):
-        assert special is not None
-        setup_key = f"{special.side}|{special.parent_candle_time}|{special.fvg_created_time}"
-        lines = [
-            "ENTRY PRICE HAS ARRIVED",
-            f"4H + M15 FVG {special.side} | live {report.last_price:.2f} | confidence {special.confidence}%",
-            f"Entry now {special.entry_low:.2f}–{special.entry_high:.2f}",
-            f"FVG {special.fvg_low:.2f}–{special.fvg_high:.2f}" if special.fvg_low is not None else "FVG unavailable",
-            f"SL {special.stop_loss:.2f}",
-            f"TP {special.take_profit_1:.2f} / {special.take_profit_2:.2f} / {special.take_profit_3:.2f}",
-            f"Regular engine agreement: {'YES' if special.aligns_with_primary else 'NO'} | macro gate {special.macro_gate}",
-            "This is a fresh first-touch entry. Do not enter later if price leaves the zone.",
-        ]
-        events.append(
-            AlertEvent(
-                f"H4_FVG_ENTRY|{setup_key}",
-                f"XAU/USD H4-FVG {special.side} — ENTRY LIVE NOW",
-                "\n".join(lines),
-                "H4_FVG_ENTRY_LIVE",
-                special.confidence,
-                transition_key="h4_fvg_entry_live",
-                transition_value=setup_key,
-            )
-        )
+    )
     return events
 
 
@@ -313,12 +298,9 @@ def record_non_alert_states(
     config: AlertConfig,
     state: AlertState,
 ) -> None:
-    """Reset entry transitions when price is no longer in an executable zone."""
+    del special, config
     if not is_primary_entry_live(report):
         state.set_transition("primary_entry_live", "WAIT")
-    if not is_fvg_entry_live(report, special):
-        state.set_transition("h4_fvg_entry_live", "WAIT")
-
 
 def send_test_alert(config: AlertConfig) -> tuple[bool, list[str]]:
     event = AlertEvent(

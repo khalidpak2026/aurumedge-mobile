@@ -160,12 +160,7 @@ def mobile_market_map_html(
 
     # Indicator paths.
     path_specs = [
-        ("avwap_active", "ANCHORED VWAP", GOLD, 2.7, ""),
-        ("avwap_high_volume", "HIGH-VOLUME AVWAP", WHITE, 1.5, 'stroke-dasharray="5 4"'),
-        ("vwap", "SESSION VWAP", CYAN, 1.2, 'stroke-dasharray="4 4"'),
-        ("ema50", "EMA50 SECONDARY", "#7dd3fc", 1.0, ""),
-        ("ema200", "EMA200 REGIME", PURPLE, 1.25, ""),
-        ("supertrend", "SUPERTREND", GREEN, 1.1, 'stroke-dasharray="7 5"'),
+        ("avwap_active", "ANCHORED VWAP", GOLD, 2.8, ""),
     ]
     for key, _, color, width, extra in path_specs:
         if key in view.columns:
@@ -231,19 +226,16 @@ def mobile_market_map_html(
             parts.append(f'<line x1="{x:.1f}" y1="{VT}" x2="{x:.1f}" y2="{VB}" stroke="{color}" stroke-width="1.2" stroke-dasharray="4 3"/>')
             parts.append(f'<text x="{x:.1f}" y="{VT+12}" text-anchor="middle" fill="{color}" font-size="8" font-weight="800">{label}</text>')
 
-    # Title and legend.
-    atr = _finite(view["atr14"].iloc[-1]) if "atr14" in view.columns else None
-    rsi = _finite(view["rsi14"].iloc[-1]) if "rsi14" in view.columns else None
-    adx = _finite(view["adx14"].iloc[-1]) if "adx14" in view.columns else None
-    stats = " · ".join(filter(None, [f"ATR {atr:.2f}" if atr else "", f"RSI {rsi:.1f}" if rsi else "", f"ADX {adx:.1f}" if adx else ""]))
+    # Title and three-pillar legend.
+    structure_label = str(view.iloc[-1].get("market_structure", "RANGE"))
     parts.append(f'<text x="{L}" y="28" fill="{TEXT}" font-size="17" font-weight="800">{_esc(symbol)} · {_esc(timeframe)}</text>')
-    parts.append(f'<text x="{L}" y="45" fill="{MUTED}" font-size="10">{_esc(stats)}</text>')
-    legend = [(GOLD, "AVWAP"), (WHITE, "HV-AVWAP"), (CYAN, "VWAP"), (PURPLE, "EMA200"), (GREEN, "Structure") ]
+    parts.append(f'<text x="{L}" y="45" fill="{MUTED}" font-size="10">MARKET STRUCTURE {_esc(structure_label)} · ANCHORED VWAP · VOLUME PROFILE</text>')
+    legend = [(GREEN, "MARKET STRUCTURE"), (GOLD, "ANCHORED VWAP"), ("#5d7899", "VOLUME PROFILE")]
     lx = 500
     for color, label in legend:
         parts.append(f'<line x1="{lx}" y1="31" x2="{lx+18}" y2="31" stroke="{color}" stroke-width="2"/>')
         parts.append(f'<text x="{lx+23}" y="35" fill="{MUTED}" font-size="9">{label}</text>')
-        lx += 94
+        lx += 145
     parts.append(f'<text x="{L}" y="{VT-8}" fill="{MUTED}" font-size="10" font-weight="700">VOLUME PROFILE · PRICE DISTRIBUTION · {profile.get("profile_state","UNAVAILABLE")}</text>')
     parts.append('</svg></div>')
     return "".join(parts)

@@ -70,114 +70,59 @@ def derive_feature_votes(
     macro: MacroConfirmation | None,
     side_hint: str | None = None,
 ) -> dict[str, int]:
-    """Return -1 bearish, 0 neutral, +1 bullish votes for stable feature groups."""
+    """Return votes for the three active pillars plus entry quality.
+
+    Legacy feature keys remain present only so old adaptive-state files load
+    without migration errors. They are always neutral in this build.
+    """
+    del liquidity, macro
+    votes: dict[str, int] = {name: 0 for name in FEATURES}
     if not indicators:
-        return {name: 0 for name in FEATURES}
+        return votes
     h1 = _snapshot(indicators, "H1")
     h4 = _snapshot(indicators, "H4")
     m15 = _snapshot(indicators, "M15")
 
-    votes: dict[str, int] = {name: 0 for name in FEATURES}
-
     structure_score = 0
-    for item in (h4, h1, m15):
-        if item.structure_bias == "bullish":
-            structure_score += 1
-        elif item.structure_bias == "bearish":
-            structure_score -= 1
-        if item.market_structure in {"BOS_UP", "CHOCH_UP"}:
-            structure_score += 1
-        elif item.market_structure in {"BOS_DOWN", "CHOCH_DOWN"}:
-            structure_score -= 1
-    votes["market_structure"] = 1 if structure_score >= 2 else -1 if structure_score <= -2 else 0
-
     avwap_score = 0
+    profile_score = 0.0
     for item in (m15, h1, h4):
-        if item.avwap_active is None:
-            continue
-        if item.close > item.avwap_active and (item.avwap_slope_atr or 0) >= -0.05:
-            avwap_score += 1
-        elif item.close < item.avwap_active and (item.avwap_slope_atr or 0) <= 0.05:
-            avwap_score -= 1
-    votes["anchored_vwap"] = 1 if avwap_score >= 2 else -1 if avwap_score <= -2 else 0
+        if item.market_structure in {"BOS_UP", "CHOCH_UP"} or item.structure_bias == "bullish":
+            structure_score += 1
+        elif item.market_structure in {"BOS_DOWN", "CHOCH_DOWN"} or item.structure_bias == "bearish":
+            structure_score -= 1
 
-    profile_score = 0
-    for item in (m15, h1, h4):
+        if item.avwap_active is not None:
+            slope = float(item.avwap_slope_atr or 0.0)
+            if item.close > float(item.avwap_active) and slope >= -0.03:
+                avwap_score += 1
+            elif item.close < float(item.avwap_active) and slope <= 0.03:
+                avwap_score -= 1
+
         if item.profile_acceptance == "bullish" or item.profile_state == "ABOVE_VALUE":
             profile_score += 1
         elif item.profile_acceptance == "bearish" or item.profile_state == "BELOW_VALUE":
             profile_score -= 1
         elif item.profile_poc is not None:
-            profile_score += 0.25 if item.close > item.profile_poc else -0.25
+            profile_score += 0.25 if item.close > float(item.profile_poc) else -0.25
+
+    votes["market_structure"] = 1 if structure_score >= 2 else -1 if structure_score <= -2 else 0
+    votes["anchored_vwap"] = 1 if avwap_score >= 2 else -1 if avwap_score <= -2 else 0
     votes["volume_profile"] = 1 if profile_score >= 1.5 else -1 if profile_score <= -1.5 else 0
 
-    # Legacy votes are retained only for backward-compatible learning history.
-    trend_values = [h1.trend, h4.trend]
-    if trend_values.count("bullish") >= 2:
-        votes["ema_trend"] = 1
-    elif trend_values.count("bearish") >= 2:
-        votes["ema_trend"] = -1
-    votes["vwap"] = 0
-    votes["volume"] = 0
-
-    momentum_score = 0
-    for item in (m15, h1):
-        if item.momentum == "bullish":
-            momentum_score += 1
-        elif item.momentum == "bearish":
-            momentum_score -= 1
-        if (item.macd_hist_slope or 0) > 0:
-            momentum_score += 0.5
-        elif (item.macd_hist_slope or 0) < 0:
-            momentum_score -= 0.5
-    votes["momentum"] = 1 if momentum_score >= 1.5 else -1 if momentum_score <= -1.5 else 0
-
-    dmi_score = 0
-    for item in (h1, h4):
-        if (item.adx14 or 0) >= 18:
-            if (item.plus_di or 0) > (item.minus_di or 0):
-                dmi_score += 1
-            elif (item.minus_di or 0) > (item.plus_di or 0):
-                dmi_score -= 1
-    votes["adx_dmi"] = 1 if dmi_score > 0 else -1 if dmi_score < 0 else 0
-
-    bull_sweep = any(item.sweep_below is not None or item.trap_type == "bear_trap" for item in liquidity)
-    bear_sweep = any(item.sweep_above is not None or item.trap_type == "bull_trap" for item in liquidity)
-    if bull_sweep and not bear_sweep:
-        votes["liquidity"] = 1
-    elif bear_sweep and not bull_sweep:
-        votes["liquidity"] = -1
-
-    breakout_score = 0
-    for item in (m15, h1):
-        if item.breakout_up:
-            breakout_score += 1
-        if item.breakout_down:
-            breakout_score -= 1
-    votes["breakout"] = 1 if breakout_score > 0 else -1 if breakout_score < 0 else 0
-
-    if macro is not None:
-        if macro.macro_bias == "BULLISH_GOLD":
-            votes["macro"] = 1
-        elif macro.macro_bias == "BEARISH_GOLD":
-            votes["macro"] = -1
-
-    # Entry quality is a quality flag, not a directional vote:
-    # +1 = acceptable/retest entry, 0 = neutral, -1 = extended/chasing entry.
-    atr = float(m15.atr14 or h1.atr14 or 0.0)
-    ema_value = float(m15.avwap_active or m15.profile_poc or m15.vwap or m15.ema20 or m15.close)
-    distance_from_value = abs(float(m15.close) - ema_value)
-    if atr > 0:
-        chasing_buy = side_hint == "BUY" and m15.close > ema_value and distance_from_value > atr * 1.00
-        chasing_sell = side_hint == "SELL" and m15.close < ema_value and distance_from_value > atr * 1.00
-        if chasing_buy or chasing_sell:
+    # Entry quality is timing only. It never decides BUY versus SELL.
+    atr = max(float(m15.atr14 or h1.atr14 or 0.0), 1e-9)
+    references = [value for value in (m15.avwap_active, m15.profile_poc, m15.profile_val, m15.profile_vah) if value is not None]
+    if references:
+        distance = min(abs(float(m15.close) - float(value)) for value in references)
+        if distance <= atr * 0.65:
+            votes["entry_quality"] = 1
+        elif distance > atr * 1.25:
             votes["entry_quality"] = -1
-        elif distance_from_value <= atr * 0.60:
-            votes["entry_quality"] = 1
-        elif side_hint == "BUY" and (m15.breakout_up or m15.structure_break_up) and distance_from_value <= atr * 0.90:
-            votes["entry_quality"] = 1
-        elif side_hint == "SELL" and (m15.breakout_down or m15.structure_break_down) and distance_from_value <= atr * 0.90:
-            votes["entry_quality"] = 1
+    if side_hint == "BUY" and (m15.structure_break_up or m15.market_structure in {"BOS_UP", "CHOCH_UP"}):
+        votes["entry_quality"] = max(votes["entry_quality"], 0)
+    elif side_hint == "SELL" and (m15.structure_break_down or m15.market_structure in {"BOS_DOWN", "CHOCH_DOWN"}):
+        votes["entry_quality"] = max(votes["entry_quality"], 0)
     return votes
 
 
@@ -333,17 +278,18 @@ class AdaptiveEngine:
     @staticmethod
     def _tf_direction(item: IndicatorSnapshot) -> int:
         score = 0
-        if item.trend == "bullish":
+        if item.market_structure in {"BOS_UP", "CHOCH_UP"} or item.structure_bias == "bullish":
+            score += 2
+        elif item.market_structure in {"BOS_DOWN", "CHOCH_DOWN"} or item.structure_bias == "bearish":
+            score -= 2
+        if item.avwap_active is not None:
+            if item.close > float(item.avwap_active):
+                score += 1
+            elif item.close < float(item.avwap_active):
+                score -= 1
+        if item.profile_acceptance == "bullish" or item.profile_state == "ABOVE_VALUE":
             score += 1
-        elif item.trend == "bearish":
-            score -= 1
-        if item.momentum == "bullish":
-            score += 1
-        elif item.momentum == "bearish":
-            score -= 1
-        if item.directional_score >= 7:
-            score += 1
-        elif item.directional_score <= -7:
+        elif item.profile_acceptance == "bearish" or item.profile_state == "BELOW_VALUE":
             score -= 1
         return 1 if score > 0 else -1 if score < 0 else 0
 
@@ -353,12 +299,7 @@ class AdaptiveEngine:
         signal_time: Any,
         feature_votes: dict[str, int],
     ) -> TechnicalReport:
-        """Calibrate confidence and block weak/repeated setups before logging.
-
-        This is deliberately stricter during the first 20 reviewed signals.
-        It uses the uploaded history immediately instead of waiting for gradual
-        weights alone to become statistically meaningful.
-        """
+        """Calibrate confidence without reintroducing discarded indicators."""
         cap = self.confidence_cap()
         report.confidence = min(int(report.confidence), cap)
         if report.active_setup is not None:
@@ -370,61 +311,36 @@ class AdaptiveEngine:
         side = report.market_state
         side_sign = 1 if side == "BUY" else -1
         reasons: list[str] = []
-
         repeat_reason = self._same_side_guard(side, signal_time)
         if repeat_reason:
             reasons.append(repeat_reason)
 
-        decided = self._decided_count()
-        if decided < self.minimum_samples:
-            adx_confirmed = int(feature_votes.get("adx_dmi", 0)) == side_sign
-            breakout_confirmed = int(feature_votes.get("breakout", 0)) == side_sign
-            structure_confirmed = int(feature_votes.get("market_structure", 0)) == side_sign
-            avwap_confirmed = int(feature_votes.get("anchored_vwap", 0)) == side_sign
-            profile_confirmed = int(feature_votes.get("volume_profile", 0)) == side_sign
-            entry_quality = int(feature_votes.get("entry_quality", 0))
-            if entry_quality < 0:
-                reasons.append("Entry is extended away from M15 value/EMA; chasing is blocked.")
-            has_structure_data = any(item.market_structure != "RANGE" or item.structure_bias != "neutral" for item in report.indicators)
-            has_avwap_data = any(item.avwap_active is not None for item in report.indicators)
-            has_profile_data = any(item.profile_state != "UNAVAILABLE" for item in report.indicators)
-            if has_structure_data and not (structure_confirmed or breakout_confirmed):
-                reasons.append("Neither market structure nor a confirmed breakout supports the direction.")
-            elif not has_structure_data and not (adx_confirmed or breakout_confirmed):
-                reasons.append("Neither ADX/DMI nor a structure breakout confirms the direction.")
-            if has_avwap_data and not avwap_confirmed:
-                reasons.append("Anchored VWAP does not confirm the proposed entry direction.")
-            if has_profile_data and not (profile_confirmed or adx_confirmed):
-                reasons.append("Volume-profile acceptance and ADX/DMI do not provide enough confirmation.")
+        if self._decided_count() < self.minimum_samples:
+            confirmations = sum(
+                int(feature_votes.get(name, 0)) == side_sign
+                for name in ("market_structure", "anchored_vwap", "volume_profile")
+            )
+            if confirmations < 2:
+                reasons.append("Fewer than two of the three active pillars confirm the direction.")
+            if int(feature_votes.get("entry_quality", 0)) < 0:
+                reasons.append("Price is extended from anchored VWAP/value; wait for a better live entry.")
 
             tf = {item.timeframe: self._tf_direction(item) for item in report.indicators}
             opposite = -side_sign
-            if tf.get("H1") == opposite and tf.get("H4") == opposite:
-                reasons.append("H1 and H4 both oppose the proposed direction.")
-            if tf.get("M15") == opposite:
-                reasons.append("M15 entry structure opposes the proposed direction.")
-            aligned = sum(1 for value in tf.values() if value == side_sign)
-            opposing = sum(1 for value in tf.values() if value == opposite)
-            if aligned < 3 and opposing >= 2:
-                reasons.append("Fewer than three timeframes confirm the direction.")
+            if tf.get("M15") == opposite and tf.get("H1") == opposite:
+                reasons.append("M15 and H1 three-pillar direction both oppose the setup.")
 
         if reasons:
             setup = report.active_setup
             setup.status = "NO_TRADE"
-            setup.entry_type = "WAIT FOR QUALIFIED ENTRY"
+            setup.entry_type = "WAIT FOR THREE-PILLAR ENTRY"
             setup.warnings = list(dict.fromkeys(reasons + setup.warnings))
-            # Capital preservation controls *execution*, not the underlying
-            # market direction.  The old behaviour rewrote a clear BUY/SELL
-            # trend as STUCK, which made the terminal appear directionless for
-            # days and hid useful pullback zones.  Keep the directional regime
-            # visible, but make the setup non-executable so alerts and learning
-            # remain silent until the entry quality improves.
             report.active_setup = setup
             report.recommendation = report.market_state
-            report.signal_label = f"{side} TREND · WAIT FOR QUALIFIED ENTRY"
+            report.signal_label = f"{side} TREND · WAIT FOR LIVE ENTRY"
             report.trap_reason = " ".join(reasons)
             report.data_quality_notes.append(
-                "Bootstrap capital-preservation gate withheld execution but preserved the directional trend classification."
+                "Adaptive safety withheld execution without changing the three-pillar directional bias."
             )
         return report
 
@@ -694,7 +610,7 @@ class AdaptiveEngine:
                 "Adverse movement is reviewed immediately, but weights change only after TP1, SL, or the fixed outcome horizon.",
                 "Weights are bounded between 0.70 and 1.30; the program never rewrites its own source code.",
                 f"Directional confidence is capped at {self.confidence_cap()}% while the reviewed sample is small.",
-                "Duplicate pending signals, post-loss cooldowns and weak entries without ADX/breakout confirmation are blocked.",
+                "Duplicate pending signals, post-loss cooldowns and weak entries without two-of-three pillar confirmation are blocked.",
                 "Target learning uses pre-exit excursion; full candle movement after an exit cannot inflate future targets.",
             ],
         )

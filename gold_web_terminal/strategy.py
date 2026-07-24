@@ -15,20 +15,12 @@ from .models import (
 from .risk_engine import RiskInputs, build_position_risk_plan
 
 
-TF_WEIGHTS = {"M5": 0.06, "M15": 0.20, "H1": 0.32, "H4": 0.31, "D1": 0.11}
+TF_WEIGHTS = {"M5": 0.08, "M15": 0.22, "H1": 0.34, "H4": 0.26, "D1": 0.10}
 DEFAULT_ADAPTIVE_WEIGHTS = {
-    "ema_trend": 1.0,
-    "momentum": 1.0,
-    "adx_dmi": 1.0,
-    "vwap": 1.0,
-    "volume": 1.0,
-    "liquidity": 1.0,
-    "breakout": 1.0,
-    "macro": 1.0,
-    "entry_quality": 1.0,
     "market_structure": 1.0,
     "anchored_vwap": 1.0,
     "volume_profile": 1.0,
+    "entry_quality": 1.0,
 }
 
 
@@ -49,124 +41,88 @@ def _weight(weights: dict[str, float], key: str) -> float:
     return max(0.70, min(1.30, float(weights.get(key, 1.0))))
 
 
+def _pillar_vote(item: IndicatorSnapshot) -> tuple[int, int, int]:
+    """Return structure, anchored-VWAP and volume-profile votes (-1/0/+1)."""
+    structure = 0
+    if item.market_structure in {"BOS_UP", "CHOCH_UP"} or item.structure_bias == "bullish":
+        structure = 1
+    elif item.market_structure in {"BOS_DOWN", "CHOCH_DOWN"} or item.structure_bias == "bearish":
+        structure = -1
+
+    avwap = 0
+    if item.avwap_active is not None:
+        slope = float(item.avwap_slope_atr or 0.0)
+        if item.close > float(item.avwap_active) and slope >= -0.03:
+            avwap = 1
+        elif item.close < float(item.avwap_active) and slope <= 0.03:
+            avwap = -1
+
+    profile = 0
+    if item.profile_acceptance == "bullish" or item.profile_state == "ABOVE_VALUE":
+        profile = 1
+    elif item.profile_acceptance == "bearish" or item.profile_state == "BELOW_VALUE":
+        profile = -1
+    elif item.profile_poc is not None:
+        distance = item.close - float(item.profile_poc)
+        atr = max(float(item.atr14 or 0.0), 1e-9)
+        if distance >= atr * 0.10:
+            profile = 1
+        elif distance <= -atr * 0.10:
+            profile = -1
+    return structure, avwap, profile
+
+
 def _weighted_market_scores(
     indicators: list[IndicatorSnapshot], adaptive_weights: dict[str, float]
 ) -> tuple[float, float, list[str], list[str]]:
+    """Score only the three requested pillars.
+
+    Market structure carries 45%, anchored VWAP 35%, and volume profile 20%.
+    No EMA, MACD, RSI, ADX, liquidity-sweep or macro vote can change direction.
+    """
     bullish = 0.0
     bearish = 0.0
     buy_reasons: list[str] = []
     sell_reasons: list[str] = []
     for item in indicators:
         tf_weight = TF_WEIGHTS.get(item.timeframe, 0.1)
-
-        structure_weight = _weight(adaptive_weights, "market_structure")
-        trend_component = abs(item.directional_score) * tf_weight * structure_weight
-        if item.directional_score > 0:
-            bullish += trend_component
-        elif item.directional_score < 0:
-            bearish += trend_component
-        if item.structure_bias == "bullish":
-            buy_reasons.append(f"{item.timeframe}: market structure {item.market_structure} favors buyers")
-        elif item.structure_bias == "bearish":
-            sell_reasons.append(f"{item.timeframe}: market structure {item.market_structure} favors sellers")
-
-        avwap_points = 9 * tf_weight * _weight(adaptive_weights, "anchored_vwap")
-        if item.avwap_active is not None:
-            if item.close > item.avwap_active and (item.avwap_slope_atr or 0) >= -0.05:
-                bullish += avwap_points
-                buy_reasons.append(f"{item.timeframe}: price holds above {item.avwap_anchor.replace('_',' ')} anchored VWAP")
-            elif item.close < item.avwap_active and (item.avwap_slope_atr or 0) <= 0.05:
-                bearish += avwap_points
-                sell_reasons.append(f"{item.timeframe}: price holds below {item.avwap_anchor.replace('_',' ')} anchored VWAP")
-
-        profile_points = 9 * tf_weight * _weight(adaptive_weights, "volume_profile")
-        if item.profile_acceptance == "bullish" or item.profile_state == "ABOVE_VALUE":
-            bullish += profile_points
-            buy_reasons.append(f"{item.timeframe}: volume profile accepts price above value")
-        elif item.profile_acceptance == "bearish" or item.profile_state == "BELOW_VALUE":
-            bearish += profile_points
-            sell_reasons.append(f"{item.timeframe}: volume profile accepts price below value")
-        elif item.profile_poc is not None:
-            if item.close > item.profile_poc:
-                bullish += profile_points * 0.35
-            elif item.close < item.profile_poc:
-                bearish += profile_points * 0.35
-
-        momentum_points = 10 * tf_weight * _weight(adaptive_weights, "momentum")
-        if item.momentum == "bullish":
-            bullish += momentum_points
-            buy_reasons.append(f"{item.timeframe}: MACD and RSI momentum are aligned up")
-        elif item.momentum == "bearish":
-            bearish += momentum_points
-            sell_reasons.append(f"{item.timeframe}: MACD and RSI momentum are aligned down")
-
-        dmi_points = 7 * tf_weight * _weight(adaptive_weights, "adx_dmi")
-        if (item.adx14 or 0) >= 18:
-            if (item.plus_di or 0) > (item.minus_di or 0):
-                bullish += dmi_points
-            elif (item.minus_di or 0) > (item.plus_di or 0):
-                bearish += dmi_points
-
-        # EMA remains a low-weight secondary confirmation only. It cannot
-        # override market structure, anchored VWAP, or volume-profile context.
-        ema_points = 2.5 * tf_weight * _weight(adaptive_weights, "ema_trend")
-        if item.ema20 is not None and item.ema50 is not None:
-            if item.close > item.ema20 > item.ema50:
-                bullish += ema_points
-            elif item.close < item.ema20 < item.ema50:
-                bearish += ema_points
-
-        breakout_points = 9 * tf_weight * _weight(adaptive_weights, "breakout")
-        if item.breakout_up or item.market_structure in {"BOS_UP", "CHOCH_UP"}:
-            bullish += breakout_points
-            buy_reasons.append(f"{item.timeframe}: market structure broke upward")
-        if item.breakout_down or item.market_structure in {"BOS_DOWN", "CHOCH_DOWN"}:
-            bearish += breakout_points
-            sell_reasons.append(f"{item.timeframe}: market structure broke downward")
-
+        structure, avwap, profile = _pillar_vote(item)
+        components = (
+            (structure, 45.0 * tf_weight * _weight(adaptive_weights, "market_structure"), "market structure"),
+            (avwap, 35.0 * tf_weight * _weight(adaptive_weights, "anchored_vwap"), "anchored VWAP"),
+            (profile, 20.0 * tf_weight * _weight(adaptive_weights, "volume_profile"), "volume profile"),
+        )
+        for vote, points, label in components:
+            if vote > 0:
+                bullish += points
+                buy_reasons.append(f"{item.timeframe}: {label} confirms buyers")
+            elif vote < 0:
+                bearish += points
+                sell_reasons.append(f"{item.timeframe}: {label} confirms sellers")
     return bullish, bearish, buy_reasons, sell_reasons
 
 
-
 def _market_stats(indicators: list[IndicatorSnapshot]) -> dict[str, float | int | bool]:
-    weighted_adx = 0.0
-    weighted_chop = 0.0
-    weight_adx = 0.0
-    weight_chop = 0.0
-    compressions = 0
-    breakout_up = False
-    breakout_down = False
-    for item in indicators:
-        weight = TF_WEIGHTS.get(item.timeframe, 0.1)
-        if item.adx14 is not None:
-            weighted_adx += item.adx14 * weight
-            weight_adx += weight
-        if item.choppiness14 is not None:
-            weighted_chop += item.choppiness14 * weight
-            weight_chop += weight
-        if item.compression and item.timeframe in {"M15", "H1", "H4"}:
-            compressions += 1
-        if item.timeframe in {"M15", "H1"}:
-            breakout_up = breakout_up or item.breakout_up
-            breakout_down = breakout_down or item.breakout_down
+    """Price-action statistics used for timing/risk, not directional voting."""
+    m15 = _select_snapshot(indicators, "M15")
+    h1 = _select_snapshot(indicators, "H1")
+    structure_up = bool(
+        m15.structure_break_up
+        or m15.market_structure in {"BOS_UP", "CHOCH_UP"}
+        or h1.market_structure == "BOS_UP"
+    )
+    structure_down = bool(
+        m15.structure_break_down
+        or m15.market_structure in {"BOS_DOWN", "CHOCH_DOWN"}
+        or h1.market_structure == "BOS_DOWN"
+    )
     return {
-        "average_adx": weighted_adx / weight_adx if weight_adx else 0.0,
-        "average_chop": weighted_chop / weight_chop if weight_chop else 50.0,
-        "compressions": compressions,
-        "breakout_up": breakout_up,
-        "breakout_down": breakout_down,
+        "breakout_up": structure_up,
+        "breakout_down": structure_down,
     }
 
 
 def _timeframe_alignment(indicators: list[IndicatorSnapshot]) -> dict[str, int]:
-    """Count directional agreement once per important timeframe.
-
-    The old engine could let one fresh liquidity sweep overrule four aligned
-    timeframes.  This helper deliberately evaluates the *stack* first.  It is
-    not a signal by itself; it is used to decide whether a sweep is a genuine
-    reversal warning or only a temporary event inside an established trend.
-    """
-
     bullish = 0
     bearish = 0
     neutral = 0
@@ -174,34 +130,11 @@ def _timeframe_alignment(indicators: list[IndicatorSnapshot]) -> dict[str, int]:
         item = next((row for row in indicators if row.timeframe == timeframe), None)
         if item is None:
             continue
-
-        bull_votes = 0
-        bear_votes = 0
-        if item.trend == "bullish":
-            bull_votes += 2
-        elif item.trend == "bearish":
-            bear_votes += 2
-        if item.structure_bias == "bullish" or item.market_structure in {"BOS_UP", "CHOCH_UP"}:
-            bull_votes += 2
-        elif item.structure_bias == "bearish" or item.market_structure in {"BOS_DOWN", "CHOCH_DOWN"}:
-            bear_votes += 2
-        if item.momentum == "bullish":
-            bull_votes += 1
-        elif item.momentum == "bearish":
-            bear_votes += 1
-        if item.directional_score >= 12:
-            bull_votes += 1
-        elif item.directional_score <= -12:
-            bear_votes += 1
-        if item.avwap_active is not None:
-            if item.close > item.avwap_active:
-                bull_votes += 1
-            elif item.close < item.avwap_active:
-                bear_votes += 1
-
-        if bull_votes >= bear_votes + 2:
+        votes = _pillar_vote(item)
+        score = sum(votes)
+        if score >= 1:
             bullish += 1
-        elif bear_votes >= bull_votes + 2:
+        elif score <= -1:
             bearish += 1
         else:
             neutral += 1
@@ -295,29 +228,43 @@ def _entry_candidate(
     h1_atr = float(h1.atr14 or m15.atr14 or price * 0.002)
     m15_atr = float(m15.atr14 or h1_atr * 0.5)
     if "breakout" in regime:
-        return price, "BREAKOUT RETEST / CURRENT ZONE"
+        return price, "LIVE THREE-PILLAR BREAKOUT"
+
+    m15_votes = _pillar_vote(m15)
+    h1_votes = _pillar_vote(h1)
+    side_sign = 1 if side == "BUY" else -1
+    m15_confirmations = sum(vote == side_sign for vote in m15_votes)
+    h1_confirmations = sum(vote == side_sign for vote in h1_votes)
+    reference = m15.avwap_active or m15.profile_poc or h1.avwap_active or h1.profile_poc
+    distance_from_value = abs(price - float(reference)) if reference is not None else 0.0
+
+    # This is the responsive continuation path. It prevents the terminal from
+    # waiting through an entire $50-$100 move when all three pillars have
+    # already aligned. It is still blocked when price is excessively extended.
+    if m15_confirmations >= 2 and h1_confirmations >= 2 and distance_from_value <= m15_atr * 1.20:
+        return price, "LIVE THREE-PILLAR CONTINUATION"
 
     if side == "BUY":
         candidates = [level for level in supports if price - h1_atr * 0.85 <= level <= price]
-        for level in (m15.avwap_active, h1.avwap_active, m15.profile_poc, h1.profile_poc, m15.vwap):
+        for level in (m15.avwap_active, h1.avwap_active, m15.profile_poc, h1.profile_poc, m15.profile_val):
             if level is not None and price - h1_atr * 0.85 <= level <= price:
                 candidates.append(float(level))
         if candidates:
             level = max(candidates)
-            if price - level <= m15_atr * 0.25:
-                return price, "CURRENT PRICE AT SUPPORT/VALUE"
-            return level + m15_atr * 0.05, "PULLBACK TO NEAREST SUPPORT/VALUE"
+            if price - level <= m15_atr * 0.35:
+                return price, "LIVE THREE-PILLAR VALUE RECLAIM"
+            return level + m15_atr * 0.05, "PULLBACK TO AVWAP / PROFILE VALUE"
     else:
         candidates = [level for level in resistances if price <= level <= price + h1_atr * 0.85]
-        for level in (m15.avwap_active, h1.avwap_active, m15.profile_poc, h1.profile_poc, m15.vwap):
+        for level in (m15.avwap_active, h1.avwap_active, m15.profile_poc, h1.profile_poc, m15.profile_vah):
             if level is not None and price <= level <= price + h1_atr * 0.85:
                 candidates.append(float(level))
         if candidates:
             level = min(candidates)
-            if level - price <= m15_atr * 0.25:
-                return price, "CURRENT PRICE AT RESISTANCE/VALUE"
-            return level - m15_atr * 0.05, "PULLBACK TO NEAREST RESISTANCE/VALUE"
-    return price, "CURRENT MARKET ZONE"
+            if level - price <= m15_atr * 0.35:
+                return price, "LIVE THREE-PILLAR VALUE REJECTION"
+            return level - m15_atr * 0.05, "PULLBACK TO AVWAP / PROFILE VALUE"
+    return price, "LIVE THREE-PILLAR MARKET ZONE"
 
 
 def _nearest_below(levels: list[float], price: float) -> float | None:
@@ -439,12 +386,12 @@ def _build_setup(
     valid_until = (datetime.now(timezone.utc) + timedelta(minutes=45)).strftime("%Y-%m-%d %H:%M UTC")
     target_basis = (
         f"Targets use adaptive reachable-range multipliers {target_multipliers['tp1']:.2f}R / "
-        f"{target_multipliers['tp2']:.2f}R / {target_multipliers['tp3']:.2f}R, capped by H1 ATR and placed before nearby liquidity."
+        f"{target_multipliers['tp2']:.2f}R / {target_multipliers['tp3']:.2f}R, capped by H1 ATR and placed before nearby structure/profile levels."
     )
     management = [
         "Do not chase outside the entry zone; recalculate if price moves more than 0.35 M15 ATR away.",
         "At TP1, take partial profit. Move the stop to breakeven only after an M15 close confirms continuation, not on a wick touch.",
-        "TP3 is a runner target; cancel it when momentum or macro confirmation reverses.",
+        "TP3 is a runner target; cancel it when market structure breaks against the trade or price loses anchored VWAP/value acceptance.",
     ]
     if risk_plan.status == "REDUCE_LOT":
         management.insert(0, f"Use approximately {risk_plan.recommended_lot:.2f} lot or less; the requested lot exceeds the risk budget.")
@@ -489,11 +436,18 @@ def build_technical_report(
     adaptive_summary: AdaptiveLearningSummary | None = None,
     risk_inputs: RiskInputs | None = None,
     macro: MacroConfirmation | None = None,
-    macro_required_for_entry: bool = True,
+    macro_required_for_entry: bool = False,
     previous_state: str | None = None,
     trap_anchor_price: float | None = None,
     trap_age: int = 0,
 ) -> TechnicalReport:
+    """Build a three-pillar XAU/USD decision.
+
+    Direction is produced exclusively by market structure, anchored VWAP and
+    volume profile. DXY and US10Y remain display-only context and never block a
+    technical entry. ATR is retained only for risk geometry and target sizing.
+    """
+    del macro_required_for_entry, previous_state, trap_anchor_price, trap_age
     if not indicators:
         raise ValueError("At least one indicator snapshot is required.")
     if not math.isfinite(price) or price <= 0:
@@ -505,236 +459,68 @@ def build_technical_report(
 
     bullish, bearish, buy_reasons, sell_reasons = _weighted_market_scores(indicators, weights)
     stats = _market_stats(indicators)
+    alignment = _timeframe_alignment(indicators)
     liq = _liquidity_context(liquidity, price)
+    m15 = _select_snapshot(indicators, "M15")
     h1 = _select_snapshot(indicators, "H1")
     h4 = _select_snapshot(indicators, "H4")
-    m15 = _select_snapshot(indicators, "M15")
+
     h1_atr = max(float(h1.atr14 or m15.atr14 or h4.atr14 or price * 0.002), point * 10)
     m15_atr = max(float(m15.atr14 or h1_atr * 0.45), point * 8)
-    atr_pct = h1.atr_pct or (h1_atr / price * 100)
+    atr_pct = float(h1.atr_pct or (h1_atr / price * 100.0))
 
-    liquidity_weight = _weight(weights, "liquidity")
-    if liq["bear_traps"] and h1.momentum == "bullish":
-        bullish += 9 * liquidity_weight
-        buy_reasons.append("Sell-side liquidity was swept and reclaimed")
-    if liq["bull_traps"] and h1.momentum == "bearish":
-        bearish += 9 * liquidity_weight
-        sell_reasons.append("Buy-side liquidity was swept and rejected")
-
-    if macro is not None:
-        macro_weight = _weight(weights, "macro")
-        macro_points = 14 * macro_weight * max(0.55, macro.coverage_score / 100.0)
-        if macro.macro_bias == "BULLISH_GOLD":
-            bullish += macro_points
-            buy_reasons.extend(macro.reasons[:3])
-        elif macro.macro_bias == "BEARISH_GOLD":
-            bearish += macro_points
-            sell_reasons.extend(macro.conflicts[:3])
-
-    average_adx = float(stats["average_adx"])
-    average_chop = float(stats["average_chop"])
-    compression_count = int(stats["compressions"])
-    alignment = _timeframe_alignment(indicators)
-    bullish_tf_count = int(alignment["bullish"])
-    bearish_tf_count = int(alignment["bearish"])
-    breakout_up = bool(stats["breakout_up"] and (m15.profile_acceptance == "bullish" or m15.profile_state == "ABOVE_VALUE" or m15.close > float(m15.profile_poc or m15.close)))
-    breakout_down = bool(stats["breakout_down"] and (m15.profile_acceptance == "bearish" or m15.profile_state == "BELOW_VALUE" or m15.close < float(m15.profile_poc or m15.close)))
     net = bullish - bearish
+    buy_score = int(round(max(5.0, min(95.0, 50.0 + net * 0.58))))
+    sell_score = 100 - buy_score
+    bullish_tf = int(alignment["bullish"])
+    bearish_tf = int(alignment["bearish"])
 
-    # Directional resolution is evaluated before the trap label.  A liquidity
-    # sweep is an event, not a market regime.  Strong displacement, a local
-    # structure break and aligned momentum must immediately release the engine
-    # into BUY or SELL even while slower H1/H4 EMAs are still catching up.
-    h1_adx = float(h1.adx14 or 0.0)
-    bull_dmi = h1_adx >= 18 and float(h1.plus_di or 0) > float(h1.minus_di or 0)
-    bear_dmi = h1_adx >= 18 and float(h1.minus_di or 0) > float(h1.plus_di or 0)
-    bull_momentum = h1.momentum == "bullish" and (m15.momentum == "bullish" or breakout_up or m15.structure_break_up)
-    bear_momentum = h1.momentum == "bearish" and (m15.momentum == "bearish" or breakout_down or m15.structure_break_down)
-    h1_above_value = h1.close > float(h1.avwap_active or h1.vwap or h1.ema20 or h1.close)
-    h1_below_value = h1.close < float(h1.avwap_active or h1.vwap or h1.ema20 or h1.close)
-    h1_above_fast = h1.close > float(h1.avwap_active or h1.ema9 or h1.ema20 or h1.close)
-    h1_below_fast = h1.close < float(h1.avwap_active or h1.ema9 or h1.ema20 or h1.close)
+    m15_votes = _pillar_vote(m15)
+    h1_votes = _pillar_vote(h1)
+    h4_votes = _pillar_vote(h4)
+    m15_bull = sum(1 for vote in m15_votes if vote > 0)
+    m15_bear = sum(1 for vote in m15_votes if vote < 0)
+    h1_bull = sum(1 for vote in h1_votes if vote > 0)
+    h1_bear = sum(1 for vote in h1_votes if vote < 0)
+    h4_bull = sum(1 for vote in h4_votes if vote > 0)
+    h4_bear = sum(1 for vote in h4_votes if vote < 0)
 
-    m15_bull_impulse = bool(
-        ((m15.impulse_1_atr or 0) >= 0.42 or (m15.impulse_3_atr or 0) >= 0.78)
-        and (m15.close_location or 0.5) >= 0.62
-    )
-    m15_bear_impulse = bool(
-        ((m15.impulse_1_atr or 0) <= -0.42 or (m15.impulse_3_atr or 0) <= -0.78)
-        and (m15.close_location or 0.5) <= 0.38
-    )
-    h1_bull_impulse = bool(
-        (h1.impulse_1_atr or 0) >= 0.30
-        or (h1.impulse_3_atr or 0) >= 0.60
-        or ((h1.macd_hist_slope or 0) > 0 and h1_above_fast)
-    )
-    h1_bear_impulse = bool(
-        (h1.impulse_1_atr or 0) <= -0.30
-        or (h1.impulse_3_atr or 0) <= -0.60
-        or ((h1.macd_hist_slope or 0) < 0 and h1_below_fast)
-    )
+    breakout_up = bool(stats["breakout_up"] and m15_bull >= 2 and h1_bear <= 1)
+    breakout_down = bool(stats["breakout_down"] and m15_bear >= 2 and h1_bull <= 1)
 
-    fast_break_up = bool(breakout_up or m15.structure_break_up)
-    fast_break_down = bool(breakout_down or m15.structure_break_down)
-
-    m15_above_value = m15.close > float(m15.avwap_active or m15.profile_poc or m15.vwap or m15.ema20 or m15.close)
-    m15_below_value = m15.close < float(m15.avwap_active or m15.profile_poc or m15.vwap or m15.ema20 or m15.close)
-    bullish_reversal_evidence = bool(
-        fast_break_up
-        and (m15_bull_impulse or m15.momentum == "bullish")
-        and (m15_above_value or m15.market_structure == "CHOCH_UP")
-    )
-    bearish_reversal_evidence = bool(
-        fast_break_down
-        and (m15_bear_impulse or m15.momentum == "bearish")
-        and (m15_below_value or m15.market_structure == "CHOCH_DOWN")
-    )
-
-    strong_bull_stack = bool(
-        bullish_tf_count >= 3
-        and bearish_tf_count <= 1
-        and h1.trend == "bullish"
-        and h4.trend in {"bullish", "neutral"}
-        and net >= 18
-        and average_adx >= 22
-    )
-    strong_bear_stack = bool(
-        bearish_tf_count >= 3
-        and bullish_tf_count <= 1
-        and h1.trend == "bearish"
-        and h4.trend in {"bearish", "neutral"}
-        and net <= -18
-        and average_adx >= 22
-    )
-    bullish_resolution = bool(
-        m15_bull_impulse
-        and fast_break_up
-        and (h1_bull_impulse or bull_dmi or h1_above_fast)
-        and net >= -14
-    )
-    bearish_resolution = bool(
-        m15_bear_impulse
-        and fast_break_down
-        and (h1_bear_impulse or bear_dmi or h1_below_fast)
-        and net <= 14
-    )
-
-    bullish_confirmation = bool(
-        bullish_resolution
+    buy_confirmed = bool(
+        breakout_up
         or (
-            net >= 10
-            and (
-                (h1.trend == "bullish" and h4.trend in {"bullish", "neutral"} and (bull_momentum or bull_dmi))
-                or (fast_break_up and (bull_momentum or m15_bull_impulse) and (h1_above_value or h1_bull_impulse))
-                or (net >= 24 and bull_momentum and h1_above_value)
-            )
+            buy_score >= 60
+            and bullish_tf >= 2
+            and m15_bull >= 2
+            and h1_bull >= 2
+            and h4_bear <= 1
         )
+        or (buy_score >= 68 and bullish_tf >= 3 and h1_bear <= 1)
     )
-    bearish_confirmation = bool(
-        bearish_resolution
+    sell_confirmed = bool(
+        breakout_down
         or (
-            net <= -10
-            and (
-                (h1.trend == "bearish" and h4.trend in {"bearish", "neutral"} and (bear_momentum or bear_dmi))
-                or (fast_break_down and (bear_momentum or m15_bear_impulse) and (h1_below_value or h1_bear_impulse))
-                or (net <= -24 and bear_momentum and h1_below_value)
-            )
+            sell_score >= 60
+            and bearish_tf >= 2
+            and m15_bear >= 2
+            and h1_bear >= 2
+            and h4_bull <= 1
         )
+        or (sell_score >= 68 and bearish_tf >= 3 and h1_bull <= 1)
     )
 
-    # A strong multi-timeframe trend should remain a directional regime while
-    # the engine waits for a safe entry.  A sweep alone is not enough to convert
-    # four aligned bearish/bullish timeframes into TRAP.  The opposite side must
-    # also produce a real M15 structure reversal.
-    if strong_bull_stack and not bearish_reversal_evidence:
-        bullish_confirmation = True
-        bearish_confirmation = False
-        buy_reasons.append(
-            f"{bullish_tf_count}/4 key timeframes are bullish with strong ADX; the trend stack overrides an unconfirmed sweep."
-        )
-    elif strong_bear_stack and not bullish_reversal_evidence:
-        bearish_confirmation = True
-        bullish_confirmation = False
-        sell_reasons.append(
-            f"{bearish_tf_count}/4 key timeframes are bearish with strong ADX; the trend stack overrides an unconfirmed sweep."
-        )
+    # When both sides appear confirmed, prefer the side with the larger score;
+    # otherwise classify as balanced rather than inventing a trap state.
+    if buy_confirmed and sell_confirmed:
+        if buy_score >= sell_score + 10:
+            sell_confirmed = False
+        elif sell_score >= buy_score + 10:
+            buy_confirmed = False
+        else:
+            buy_confirmed = sell_confirmed = False
 
-    bull_trap_levels: dict[str, float] = liq.get("bull_trap_levels", {})
-    bear_trap_levels: dict[str, float] = liq.get("bear_trap_levels", {})
-    bull_trap_near = any(abs(price - level) <= h1_atr * 0.45 for level in bull_trap_levels.values())
-    bear_trap_near = any(abs(price - level) <= h1_atr * 0.45 for level in bear_trap_levels.values())
-    two_sided_fresh = bool(liq.get("two_sided_timeframes"))
-
-    # Same-side sweeps support the opposite direction.  They only create a
-    # temporary no-trade TRAP when price has not yet resolved and the attempted
-    # move is directly contradicted.  A confirmed directional impulse always
-    # overrides the trap label.
-    liquidity_conflict = bool(
-        (
-            bull_trap_near
-            and bullish_confirmation
-            and bearish_reversal_evidence
-            and not bullish_resolution
-        )
-        or (
-            bear_trap_near
-            and bearish_confirmation
-            and bullish_reversal_evidence
-            and not bearish_resolution
-        )
-    )
-    unresolved_two_sided = bool(
-        two_sided_fresh
-        and abs(net) < 36
-        and not bullish_resolution
-        and not bearish_resolution
-        and not bullish_confirmation
-        and not bearish_confirmation
-    )
-    trap = bool(liquidity_conflict or unresolved_two_sided)
-
-    trap_release_side: str | None = None
-    if bullish_resolution:
-        trap = False
-        bullish_confirmation = True
-        bearish_confirmation = False
-        if previous_state == "TRAP":
-            trap_release_side = "BUY"
-            buy_reasons.append("The prior liquidity event resolved into a confirmed bullish structure break")
-    elif bearish_resolution:
-        trap = False
-        bearish_confirmation = True
-        bullish_confirmation = False
-        if previous_state == "TRAP":
-            trap_release_side = "SELL"
-            sell_reasons.append("The prior liquidity event resolved into a confirmed bearish structure break")
-    elif trap and previous_state == "TRAP" and trap_anchor_price is not None:
-        displacement_r = (price - float(trap_anchor_price)) / h1_atr
-        if trap_age >= 2:
-            # A trap may block at most two refresh cycles without fresh evidence.
-            trap = False
-        elif displacement_r >= 0.45 and net >= 4 and (m15_bull_impulse or bull_momentum or bull_dmi):
-            trap = False
-            bullish_confirmation = True
-            bearish_confirmation = False
-            trap_release_side = "BUY"
-            buy_reasons.append("Price displaced above the prior trap anchor and held bullish momentum")
-        elif displacement_r <= -0.45 and net <= -4 and (m15_bear_impulse or bear_momentum or bear_dmi):
-            trap = False
-            bearish_confirmation = True
-            bullish_confirmation = False
-            trap_release_side = "SELL"
-            sell_reasons.append("Price displaced below the prior trap anchor and held bearish momentum")
-
-    stuck = (
-        not bullish_confirmation
-        and not bearish_confirmation
-        and (
-            (average_adx < 17.5 and average_chop > 61.0)
-            or (compression_count >= 2 and average_adx < 20)
-            or (h1.trend == "neutral" and h4.trend == "neutral" and abs(net) < 8)
-        )
-    )
     if atr_pct >= 0.85:
         volatility_state = "extreme"
     elif atr_pct >= 0.48:
@@ -745,116 +531,31 @@ def build_technical_report(
         volatility_state = "normal"
 
     trap_reason = ""
-    if trap:
-        market_state = "TRAP"
-        regime = "liquidity_trap"
-        signal_label = "NO TRADE · FRESH LIQUIDITY CONFLICT"
-        if unresolved_two_sided:
-            trap_reason = "Both sides were swept in the same active timeframe and direction has not yet resolved."
-        elif bull_trap_near:
-            trap_reason = "A fresh buy-side sweep conflicts with the attempted bullish move."
-        else:
-            trap_reason = "A fresh sell-side sweep conflicts with the attempted bearish move."
-    elif bullish_confirmation:
+    if buy_confirmed:
         market_state = "BUY"
-        regime = "breakout_up" if breakout_up or trap_release_side == "BUY" else (
+        regime = "breakout_up" if breakout_up else (
             "volatile_bullish" if volatility_state in {"high", "extreme"} else "bullish_trend"
         )
-        if trap_release_side == "BUY":
-            signal_label = "ENTER BUY · TRAP RESOLVED"
-        elif breakout_up:
-            signal_label = "ENTER BUY · BREAKOUT CONFIRMED"
-            bullish += 7
-        else:
-            signal_label = "ENTER BUY · TREND CONFIRMED"
-    elif bearish_confirmation:
+        signal_label = "ENTER BUY · THREE-PILLAR BREAKOUT" if breakout_up else "ENTER BUY · THREE-PILLAR TREND"
+    elif sell_confirmed:
         market_state = "SELL"
-        regime = "breakout_down" if breakout_down or trap_release_side == "SELL" else (
+        regime = "breakout_down" if breakout_down else (
             "volatile_bearish" if volatility_state in {"high", "extreme"} else "bearish_trend"
         )
-        if trap_release_side == "SELL":
-            signal_label = "ENTER SELL · TRAP RESOLVED"
-        elif breakout_down:
-            signal_label = "ENTER SELL · BREAKOUT CONFIRMED"
-            bearish += 7
-        else:
-            signal_label = "ENTER SELL · TREND CONFIRMED"
-    elif stuck:
-        market_state = "STUCK"
-        regime = "stuck_range"
-        signal_label = "NO TRADE · MARKET STUCK"
-        trap_reason = "Trend strength is weak and price is compressed or balanced."
-    elif breakout_up and net >= 4:
-        market_state = "BUY"
-        regime = "breakout_up"
-        signal_label = "ENTER BUY · EARLY BREAKOUT"
-        bullish += 5
-    elif breakout_down and net <= -4:
-        market_state = "SELL"
-        regime = "breakout_down"
-        signal_label = "ENTER SELL · EARLY BREAKOUT"
-        bearish += 5
-    elif net >= 8:
-        market_state = "BUY"
-        regime = "volatile_bullish" if volatility_state in {"high", "extreme"} else "bullish_trend"
-        signal_label = "ENTER BUY · DIRECTIONAL BIAS"
-    elif net <= -8:
-        market_state = "SELL"
-        regime = "volatile_bearish" if volatility_state in {"high", "extreme"} else "bearish_trend"
-        signal_label = "ENTER SELL · DIRECTIONAL BIAS"
+        signal_label = "ENTER SELL · THREE-PILLAR BREAKOUT" if breakout_down else "ENTER SELL · THREE-PILLAR TREND"
     else:
         market_state = "STUCK"
         regime = "stuck_range"
-        signal_label = "NO TRADE · INSUFFICIENT EDGE"
-        trap_reason = "Directional evidence is too balanced to justify a trade."
-
-    # Macro is an execution gate, not a decorative score. When enabled and
-    # required, incomplete or conflicting macro data cannot produce a high-
-    # confidence entry. Mixed macro can only pass an exceptionally strong,
-    # aligned technical trend.
-    if market_state in {"BUY", "SELL"} and macro is not None:
-        technical_alignment = (
-            (market_state == "BUY" and h1.trend == "bullish" and h4.trend == "bullish")
-            or (market_state == "SELL" and h1.trend == "bearish" and h4.trend == "bearish")
+        signal_label = "NO TRADE · THREE PILLARS NOT ALIGNED"
+        trap_reason = (
+            "Market structure, anchored VWAP and volume profile do not yet agree on one direction. "
+            "DXY and US10Y are informational only and did not block a signal."
         )
-        if macro_required_for_entry and (macro.gate == "UNAVAILABLE" or macro.coverage_score < 80):
-            trap_reason = "DXY/yield/gold-flow coverage is incomplete, so the execution gate blocks a directional entry."
-            market_state = "STUCK"
-            regime = "stuck_range"
-            signal_label = "NO TRADE · MACRO DATA INCOMPLETE"
-        elif macro.gate == "CONFLICT":
-            trap_reason = f"Technical {market_state} conflicts with DXY/US10Y/gold-flow confirmation."
-            market_state = "STUCK"
-            regime = "stuck_range"
-            signal_label = "NO TRADE · MACRO CONFLICT"
-        elif macro.gate == "NEUTRAL" and macro_required_for_entry:
-            strong_stack = strong_bull_stack if market_state == "BUY" else strong_bear_stack
-            # Mixed DXY/yield data should reduce confidence, not erase a clear
-            # 3-to-4 timeframe trend.  It still blocks weak or poorly aligned
-            # entries, but no longer turns an obvious 93/7 directional stack
-            # into STUCK merely because macro is neutral.
-            if (not strong_stack) and (abs(net) < 30 or average_adx < 24 or not technical_alignment):
-                trap_reason = "DXY and yield are mixed; technical strength is not exceptional enough to justify execution."
-                market_state = "STUCK"
-                regime = "stuck_range"
-                signal_label = "NO TRADE · MACRO MIXED"
 
-    net = bullish - bearish
-    buy_score = int(round(50 + math.tanh(net / 28.0) * 45))
-    buy_score = max(5, min(95, buy_score))
-    sell_score = 100 - buy_score
-    trend_strength = int(round(max(0, min(100, average_adx * 2.4 + abs(net) * 0.30))))
-    if market_state in {"STUCK", "TRAP"}:
-        confidence = int(round(max(55, min(88, 57 + average_chop * 0.25 + compression_count * 4))))
-    else:
-        directional_score = buy_score if market_state == "BUY" else sell_score
-        confidence = int(round(max(52, min(88, 42 + directional_score * 0.34 + average_adx * 0.45))))
-        if macro is not None and macro.gate == "CONFIRM":
-            confidence = min(92, confidence + 8)
-        elif macro is not None and macro.gate == "NEUTRAL":
-            confidence = min(74, max(50, confidence - 5))
-        elif macro is not None and macro.gate in {"CONFLICT", "UNAVAILABLE"}:
-            confidence = max(50, confidence - 16)
+    edge = max(buy_score, sell_score) - 50
+    aligned_tf = bullish_tf if market_state == "BUY" else bearish_tf if market_state == "SELL" else max(bullish_tf, bearish_tf)
+    confidence = int(round(max(52, min(88, 54 + edge * 0.48 + aligned_tf * 3.5))))
+    trend_strength = int(round(max(0, min(100, abs(net) * 1.15 + aligned_tf * 12))))
 
     active_buy = market_state == "BUY"
     active_sell = market_state == "SELL"
@@ -867,35 +568,29 @@ def build_technical_report(
         active_sell, sell_reasons, data_source, m15, h1, str(regime), risk, targets,
     )
     active_setup = buy_setup if active_buy else sell_setup if active_sell else None
+
     if active_setup is not None and active_setup.risk_plan is not None:
         if active_setup.risk_plan.status == "REDUCE_LOT":
             signal_label += " · REDUCE LOT"
         elif active_setup.risk_plan.status == "NO_TRADE":
             signal_label = f"{market_state} BIAS · RISK TOO HIGH"
 
-    # The terminal now separates directional regime from execution timing.
-    # BUY/SELL can remain visible instead of falling back to TRAP/STUCK, while
-    # Telegram remains silent until the current live price reaches the entry.
     if active_setup is not None and active_setup.status == "ENTER":
-        entry_tolerance = max(0.12 * m15_atr, 0.25)
-        entry_live = (
-            active_setup.entry_low - entry_tolerance
-            <= price
-            <= active_setup.entry_high + entry_tolerance
-        )
+        entry_tolerance = max(0.20 * m15_atr, 0.35)
+        entry_live = active_setup.entry_low - entry_tolerance <= price <= active_setup.entry_high + entry_tolerance
         if entry_live:
-            signal_label = f"{signal_label} · ENTRY LIVE NOW"
+            signal_label += " · ENTRY LIVE NOW"
         else:
-            signal_label = f"{signal_label} · WAIT FOR ENTRY ZONE"
+            signal_label += " · WAIT FOR ENTRY ZONE"
             active_setup.warnings.append(
-                "Directional setup is active, but no alert is sent until the live price reaches the displayed entry zone."
+                "Direction is active, but Telegram remains silent until live price reaches the entry zone."
             )
 
     notes = [
-        "The decision engine prioritizes multi-timeframe market structure, anchored VWAP and volume-profile acceptance, then confirms with momentum, DMI/ADX, ATR, liquidity and the DXY/US10Y/gold-flow execution gate.",
-        "Stops remain outside structural invalidation. Position size is reduced when that stop is too expensive; the engine does not invent a dangerously tight stop to accommodate a large lot.",
-        "Targets begin with a conservative 0.65R / 1.05R / 1.40R ladder and adapt only from clean pre-exit excursion evidence.",
-        "Adaptive learning is bounded, evidence-weighted and based on completed signals; it cannot guarantee future accuracy.",
+        "Directional decisions use only market structure, anchored VWAP and volume profile.",
+        "DXY and US10Y are display-only context; they cannot block or reverse a signal.",
+        "ATR is used only to place realistic stops, targets and entry tolerances; it does not vote on direction.",
+        "The FVG specialist strategy and EMA/MACD/RSI/ADX decision layers are disabled in this build.",
     ]
     notes.extend(extra_notes or [])
 
@@ -921,5 +616,6 @@ def build_technical_report(
         sell_setup=sell_setup,
         macro=macro,
         adaptive=adaptive_summary,
+        special_signals=[],
         data_quality_notes=notes,
     )
