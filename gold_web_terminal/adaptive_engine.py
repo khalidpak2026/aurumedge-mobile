@@ -1,490 +1,347 @@
 from __future__ import annotations
 
+"""Bounded three-pillar adaptive learning for AurumEdge v5.8.1.
+
+The learner starts updating after the first completed delivered trade, while a
+Bayesian prior and per-review change cap prevent one outcome from dominating.
+Unknown legacy sections in adaptive_state.json are preserved during migration.
+"""
+
+from copy import deepcopy
+from datetime import datetime, timezone
+import hashlib
 import json
 import math
-from copy import deepcopy
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
 import pandas as pd
 
-from .models import AdaptiveLearningSummary, IndicatorSnapshot, LiquiditySnapshot, MacroConfirmation, TechnicalReport
 
-
-FEATURES = (
-    "market_structure",
-    "anchored_vwap",
-    "volume_profile",
-    "momentum",
-    "adx_dmi",
-    "liquidity",
-    "breakout",
-    "macro",
-    "entry_quality",
-    # Legacy features remain loadable so existing adaptive-state files migrate
-    # cleanly, but they no longer drive the primary decision.
-    "ema_trend",
-    "vwap",
-    "volume",
-)
+PILLARS = ("market_structure", "anchored_vwap", "volume_profile")
 
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _default_state() -> dict[str, Any]:
-    return {
-        "version": 3,
-        "created_at": _utc_now(),
-        "updated_at": _utc_now(),
-        "features": {
-            name: {"alpha": 5.0, "beta": 5.0, "weight": 1.0, "samples": 0}
-            for name in FEATURES
-        },
-        "signals": [],
-        "reviews": [],
-        "target_mfe_r": [],
-        "counts": {"wins": 0, "losses": 0, "timeouts": 0},
-        "last_review": "No completed signals have been reviewed yet.",
-    }
-
-
-def _safe_number(value: Any) -> float | None:
+def _finite(value: Any, default: float = 0.0) -> float:
     try:
         number = float(value)
     except (TypeError, ValueError):
-        return None
-    return number if math.isfinite(number) else None
+        return default
+    return number if math.isfinite(number) else default
 
 
-def _snapshot(items: list[IndicatorSnapshot], timeframe: str) -> IndicatorSnapshot:
-    return next((item for item in items if item.timeframe == timeframe), items[0])
+def _get(obj: Any, name: str, default: Any = None) -> Any:
+    if isinstance(obj, dict):
+        return obj.get(name, default)
+    return getattr(obj, name, default)
+
+
+def _set(obj: Any, name: str, value: Any) -> None:
+    if isinstance(obj, dict):
+        obj[name] = value
+        return
+    try:
+        setattr(obj, name, value)
+    except Exception:
+        try:
+            object.__setattr__(obj, name, value)
+        except Exception:
+            pass
+
+
+def _feature_default() -> dict[str, Any]:
+    return {"alpha": 5.0, "beta": 5.0, "weight": 1.0, "samples": 0, "wins": 0, "losses": 0}
+
+
+def _defaults() -> dict[str, Any]:
+    return {
+        "version": 3,
+        "features": {name: _feature_default() for name in PILLARS},
+        "signals": [],
+        "reviews": [],
+        "counts": {"wins": 0, "losses": 0, "timeouts": 0},
+        "target_multipliers": {"tp1": 0.65, "tp2": 1.05, "tp3": 1.40},
+        "target_mfe_r": [],
+        "patterns": {},
+        "last_review": "No completed delivered trades have been reviewed yet.",
+    }
 
 
 def derive_feature_votes(
-    indicators: list[IndicatorSnapshot],
-    liquidity: list[LiquiditySnapshot],
-    macro: MacroConfirmation | None,
-    side_hint: str | None = None,
+    indicators: list[Any],
+    liquidity: list[Any] | None = None,
+    macro: Any | None = None,
+    market_state: str | None = None,
 ) -> dict[str, int]:
-    """Return votes for the three active pillars plus entry quality.
+    """Compatibility wrapper around the three-pillar strategy vote function."""
+    from .strategy import derive_feature_votes as strategy_votes
 
-    Legacy feature keys remain present only so old adaptive-state files load
-    without migration errors. They are always neutral in this build.
-    """
-    del liquidity, macro
-    votes: dict[str, int] = {name: 0 for name in FEATURES}
-    if not indicators:
-        return votes
-    h1 = _snapshot(indicators, "H1")
-    h4 = _snapshot(indicators, "H4")
-    m15 = _snapshot(indicators, "M15")
-
-    structure_score = 0
-    avwap_score = 0
-    profile_score = 0.0
-    for item in (m15, h1, h4):
-        if item.market_structure in {"BOS_UP", "CHOCH_UP"} or item.structure_bias == "bullish":
-            structure_score += 1
-        elif item.market_structure in {"BOS_DOWN", "CHOCH_DOWN"} or item.structure_bias == "bearish":
-            structure_score -= 1
-
-        if item.avwap_active is not None:
-            slope = float(item.avwap_slope_atr or 0.0)
-            if item.close > float(item.avwap_active) and slope >= -0.03:
-                avwap_score += 1
-            elif item.close < float(item.avwap_active) and slope <= 0.03:
-                avwap_score -= 1
-
-        if item.profile_acceptance == "bullish" or item.profile_state == "ABOVE_VALUE":
-            profile_score += 1
-        elif item.profile_acceptance == "bearish" or item.profile_state == "BELOW_VALUE":
-            profile_score -= 1
-        elif item.profile_poc is not None:
-            profile_score += 0.25 if item.close > float(item.profile_poc) else -0.25
-
-    votes["market_structure"] = 1 if structure_score >= 2 else -1 if structure_score <= -2 else 0
-    votes["anchored_vwap"] = 1 if avwap_score >= 2 else -1 if avwap_score <= -2 else 0
-    votes["volume_profile"] = 1 if profile_score >= 1.5 else -1 if profile_score <= -1.5 else 0
-
-    # Entry quality is timing only. It never decides BUY versus SELL.
-    atr = max(float(m15.atr14 or h1.atr14 or 0.0), 1e-9)
-    references = [value for value in (m15.avwap_active, m15.profile_poc, m15.profile_val, m15.profile_vah) if value is not None]
-    if references:
-        distance = min(abs(float(m15.close) - float(value)) for value in references)
-        if distance <= atr * 0.65:
-            votes["entry_quality"] = 1
-        elif distance > atr * 1.25:
-            votes["entry_quality"] = -1
-    if side_hint == "BUY" and (m15.structure_break_up or m15.market_structure in {"BOS_UP", "CHOCH_UP"}):
-        votes["entry_quality"] = max(votes["entry_quality"], 0)
-    elif side_hint == "SELL" and (m15.structure_break_down or m15.market_structure in {"BOS_DOWN", "CHOCH_DOWN"}):
-        votes["entry_quality"] = max(votes["entry_quality"], 0)
-    return votes
+    return strategy_votes(indicators, liquidity, macro, market_state)
 
 
 class AdaptiveEngine:
-    """Controlled online learner.
-
-    It never rewrites source code and never changes weights from a single adverse candle.
-    Completed signals update bounded feature reliabilities after a minimum evidence threshold.
-    """
-
     def __init__(
         self,
-        path: str | Path,
+        state_path: str | Path,
         enabled: bool = True,
         minimum_samples: int = 20,
         horizon_bars: int = 12,
         max_weight_change: float = 0.05,
     ) -> None:
-        self.path = Path(path)
-        self.enabled = enabled
-        self.minimum_samples = max(8, int(minimum_samples))
-        self.horizon_bars = max(4, int(horizon_bars))
-        self.max_weight_change = max(0.01, min(0.20, float(max_weight_change)))
-        self.state = self._load()
+        self.state_path = Path(state_path)
+        self.enabled = bool(enabled)
+        self.minimum_samples = max(1, int(minimum_samples))
+        self.horizon_bars = max(3, int(horizon_bars))
+        self.max_weight_change = max(0.005, min(0.10, float(max_weight_change)))
+        self.state = self._load_and_migrate()
 
-    def _load(self) -> dict[str, Any]:
-        if not self.path.exists():
-            return _default_state()
+    def _load_and_migrate(self) -> dict[str, Any]:
+        state: dict[str, Any] = {}
         try:
-            data = json.loads(self.path.read_text(encoding="utf-8"))
-            base = _default_state()
-            base.update(data if isinstance(data, dict) else {})
-            base["features"] = {**_default_state()["features"], **base.get("features", {})}
-            # v2 fixes entry_quality semantics (+1 good, -1 poor). Rebuild that
-            # feature from completed signals so older directional treatment does
-            # not contaminate the new capital-preservation gate.
-            if int(base.get("version", 1)) < 2:
-                quality = {"alpha": 5.0, "beta": 5.0, "weight": 1.0, "samples": 0}
-                for signal in base.get("signals", []):
-                    outcome = signal.get("status")
-                    vote = int(signal.get("feature_votes", {}).get("entry_quality", 0))
-                    if outcome not in {"WIN", "LOSS"} or vote == 0:
-                        continue
-                    quality["samples"] += 1
-                    correct = (outcome == "WIN" and vote > 0) or (outcome == "LOSS" and vote < 0)
-                    quality["alpha" if correct else "beta"] += 1.0
-                base["features"]["entry_quality"] = quality
-            base["version"] = 3
-            return base
-        except Exception:
-            backup = self.path.with_suffix(self.path.suffix + ".corrupt")
-            try:
-                self.path.replace(backup)
-            except OSError:
-                pass
-            return _default_state()
+            if self.state_path.exists():
+                parsed = json.loads(self.state_path.read_text(encoding="utf-8"))
+                if isinstance(parsed, dict):
+                    state = parsed
+        except (OSError, json.JSONDecodeError):
+            state = {}
+        defaults = _defaults()
+        for key, value in defaults.items():
+            state.setdefault(key, deepcopy(value))
+        raw_features = state.setdefault("features", {})
+        for name in PILLARS:
+            old = raw_features.get(name, {})
+            merged = _feature_default()
+            if isinstance(old, dict):
+                merged.update(old)
+            merged["weight"] = max(0.70, min(1.30, _finite(merged.get("weight"), 1.0)))
+            raw_features[name] = merged
+        state["counts"] = {**defaults["counts"], **(state.get("counts") or {})}
+        state["target_multipliers"] = {
+            **defaults["target_multipliers"],
+            **(state.get("target_multipliers") or {}),
+        }
+        for key in ("signals", "reviews", "target_mfe_r"):
+            if not isinstance(state.get(key), list):
+                state[key] = []
+        if not isinstance(state.get("patterns"), dict):
+            state["patterns"] = {}
+        state["version"] = 3
+        return state
 
     def save(self) -> None:
         if not self.enabled:
             return
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.state["updated_at"] = _utc_now()
-        temp = self.path.with_suffix(self.path.suffix + ".tmp")
-        temp.write_text(json.dumps(self.state, indent=2, ensure_ascii=False), encoding="utf-8")
-        temp.replace(self.path)
+        self.state_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self.state_path.with_suffix(self.state_path.suffix + ".tmp")
+        temporary.write_text(json.dumps(self.state, indent=2, default=str), encoding="utf-8")
+        temporary.replace(self.state_path)
 
     def weights(self) -> dict[str, float]:
         return {
-            name: float(self.state.get("features", {}).get(name, {}).get("weight", 1.0))
-            for name in FEATURES
+            name: max(0.70, min(1.30, _finite(self.state["features"].get(name, {}).get("weight"), 1.0)))
+            for name in PILLARS
         }
 
     def target_multipliers(self) -> dict[str, float]:
-        """Return conservative, reachable targets until clean evidence exists.
-
-        Early capital-preservation defaults are intentionally closer than the
-        old 0.80R/1.30R/1.80R ladder. Full adaptation starts only after the
-        configured evidence threshold.
-        """
-        completed = [row for row in self.state.get("signals", []) if row.get("status") in {"WIN", "LOSS", "TIMEOUT"}]
-        clean_all = []
-        clean_wins = []
-        for row in completed:
-            value = _safe_number(row.get("pre_exit_mfe_r", row.get("mfe_r")))
-            if value is None:
-                continue
-            value = max(0.0, min(5.0, value))
-            clean_all.append(value)
-            if row.get("status") == "WIN":
-                runner = _safe_number(row.get("runner_mfe_r", row.get("horizon_mfe_r", value)))
-                clean_wins.append(max(value, min(5.0, runner if runner is not None else value)))
-
-        # Protect capital while the sample is small. These levels reflect the
-        # uploaded history: TP1 was reachable around 0.8R, while larger targets
-        # were inconsistent.
-        if len(clean_all) < self.minimum_samples:
-            return {"tp1": 0.65, "tp2": 1.05, "tp3": 1.40}
-
-        all_values = np.asarray(clean_all[-250:], dtype=float)
-        win_values = np.asarray((clean_wins or clean_all)[-250:], dtype=float)
-        tp1 = float(np.quantile(all_values, 0.45))
-        tp2 = float(np.quantile(win_values, 0.55))
-        tp3 = float(np.quantile(win_values, 0.75))
-        tp1 = max(0.55, min(0.90, tp1))
-        tp2 = max(tp1 + 0.25, min(1.35, tp2))
-        tp3 = max(tp2 + 0.25, min(1.80, tp3))
+        raw = self.state.get("target_multipliers", {})
+        tp1 = max(0.60, min(0.90, _finite(raw.get("tp1"), 0.65)))
+        tp2 = max(tp1 + 0.20, min(1.35, _finite(raw.get("tp2"), 1.05)))
+        tp3 = max(tp2 + 0.20, min(1.80, _finite(raw.get("tp3"), 1.40)))
         return {"tp1": round(tp1, 2), "tp2": round(tp2, 2), "tp3": round(tp3, 2)}
 
-    def _decided_count(self) -> int:
+    def summary(self) -> Any:
         counts = self.state.get("counts", {})
-        return int(counts.get("wins", 0)) + int(counts.get("losses", 0))
-
-    def confidence_cap(self) -> int:
-        decided = self._decided_count()
-        if decided < 5:
-            return 68
-        if decided < 10:
-            return 72
-        if decided < 20:
-            return 78
-        if decided < 40:
-            return 84
-        return 90
-
-    def _same_side_guard(self, side: str, signal_time: Any) -> str | None:
-        now = pd.to_datetime(signal_time, utc=True)
-        rows = [row for row in self.state.get("signals", []) if row.get("side") == side]
-        pending = [row for row in rows if row.get("status") == "PENDING"]
-        for row in pending:
-            prior = pd.to_datetime(row.get("signal_time"), utc=True, errors="coerce")
-            if pd.notna(prior) and now > prior:
-                return f"An earlier {side} signal is still pending; duplicate entries are blocked until it resolves."
-
-        completed = [row for row in rows if row.get("status") in {"WIN", "LOSS"}]
-        completed.sort(key=lambda row: str(row.get("outcome_time") or row.get("signal_time") or ""))
-        if completed:
-            last = completed[-1]
-            last_time = pd.to_datetime(last.get("outcome_time") or last.get("signal_time"), utc=True, errors="coerce")
-            if pd.notna(last_time):
-                elapsed = now - last_time
-                cooldown = timedelta(minutes=60 if last.get("status") == "LOSS" else 30)
-                if timedelta(0) <= elapsed < cooldown:
-                    return f"{side} cooldown is active after the previous {last.get('status', '').lower()} signal."
-        recent_losses = [row for row in completed[-3:] if row.get("status") == "LOSS"]
-        if len(recent_losses) >= 2:
-            last_loss_time = pd.to_datetime(recent_losses[-1].get("outcome_time") or recent_losses[-1].get("signal_time"), utc=True, errors="coerce")
-            first_loss_time = pd.to_datetime(recent_losses[-2].get("outcome_time") or recent_losses[-2].get("signal_time"), utc=True, errors="coerce")
-            if pd.notna(last_loss_time) and pd.notna(first_loss_time):
-                if last_loss_time - first_loss_time <= timedelta(hours=6) and now - last_loss_time < timedelta(hours=2):
-                    return f"Two recent {side} losses triggered a two-hour capital-preservation lock."
-        return None
-
-    @staticmethod
-    def _tf_direction(item: IndicatorSnapshot) -> int:
-        score = 0
-        if item.market_structure in {"BOS_UP", "CHOCH_UP"} or item.structure_bias == "bullish":
-            score += 2
-        elif item.market_structure in {"BOS_DOWN", "CHOCH_DOWN"} or item.structure_bias == "bearish":
-            score -= 2
-        if item.avwap_active is not None:
-            if item.close > float(item.avwap_active):
-                score += 1
-            elif item.close < float(item.avwap_active):
-                score -= 1
-        if item.profile_acceptance == "bullish" or item.profile_state == "ABOVE_VALUE":
-            score += 1
-        elif item.profile_acceptance == "bearish" or item.profile_state == "BELOW_VALUE":
-            score -= 1
-        return 1 if score > 0 else -1 if score < 0 else 0
+        pending = sum(1 for row in self.state.get("signals", []) if row.get("status") == "PENDING")
+        reviewed = int(counts.get("wins", 0)) + int(counts.get("losses", 0)) + int(counts.get("timeouts", 0))
+        return SimpleNamespace(
+            reviewed_signals=reviewed,
+            pending_signals=pending,
+            wins=int(counts.get("wins", 0)),
+            losses=int(counts.get("losses", 0)),
+            timeouts=int(counts.get("timeouts", 0)),
+            weights=self.weights(),
+            target_multipliers=self.target_multipliers(),
+            last_review=str(self.state.get("last_review", "")),
+        )
 
     def apply_capital_preservation(
         self,
-        report: TechnicalReport,
-        signal_time: Any,
-        feature_votes: dict[str, int],
-    ) -> TechnicalReport:
-        """Calibrate confidence without reintroducing discarded indicators."""
-        cap = self.confidence_cap()
-        report.confidence = min(int(report.confidence), cap)
-        if report.active_setup is not None:
-            report.active_setup.confidence = min(int(report.active_setup.confidence), cap)
+        report: Any,
+        signal_time: Any | None = None,
+        feature_votes: dict[str, int] | None = None,
+    ) -> Any:
+        """Keep risk blocking separate from direction and force live-zone truth.
 
-        if report.market_state not in {"BUY", "SELL"} or report.active_setup is None:
+        A historical cooldown or pending-record flag is deliberately not used
+        here. If current price is inside the displayed zone and its risk plan is
+        not BLOCK, the setup is ENTRY LIVE.
+        """
+        setup = _get(report, "active_setup")
+        state = str(_get(report, "market_state", "STUCK"))
+        if setup is None or state not in {"BUY", "SELL"}:
             return report
-
-        side = report.market_state
-        side_sign = 1 if side == "BUY" else -1
-        reasons: list[str] = []
-        repeat_reason = self._same_side_guard(side, signal_time)
-        if repeat_reason:
-            reasons.append(repeat_reason)
-
-        if self._decided_count() < self.minimum_samples:
-            confirmations = sum(
-                int(feature_votes.get(name, 0)) == side_sign
-                for name in ("market_structure", "anchored_vwap", "volume_profile")
-            )
-            if confirmations < 2:
-                reasons.append("Fewer than two of the three active pillars confirm the direction.")
-            if int(feature_votes.get("entry_quality", 0)) < 0:
-                reasons.append("Price is extended from anchored VWAP/value; wait for a better live entry.")
-
-            tf = {item.timeframe: self._tf_direction(item) for item in report.indicators}
-            opposite = -side_sign
-            if tf.get("M15") == opposite and tf.get("H1") == opposite:
-                reasons.append("M15 and H1 three-pillar direction both oppose the setup.")
-
-        if reasons:
-            setup = report.active_setup
-            setup.status = "NO_TRADE"
-            setup.entry_type = "WAIT FOR THREE-PILLAR ENTRY"
-            setup.warnings = list(dict.fromkeys(reasons + setup.warnings))
-            report.active_setup = setup
-            report.recommendation = report.market_state
-            report.signal_label = f"{side} TREND · WAIT FOR LIVE ENTRY"
-            report.trap_reason = " ".join(reasons)
-            report.data_quality_notes.append(
-                "Adaptive safety withheld execution without changing the three-pillar directional bias."
-            )
+        price = _finite(_get(report, "last_price"))
+        low = _finite(_get(setup, "entry_low"))
+        high = _finite(_get(setup, "entry_high"))
+        risk_plan = _get(setup, "risk_plan")
+        risk_status = str(_get(risk_plan, "status", "OK"))
+        inside = low <= price <= high
+        if inside and risk_status != "BLOCK":
+            _set(setup, "status", "ENTER")
+            _set(setup, "entry_live", True)
+            _set(report, "entry_live", True)
+            _set(report, "execution_label", f"ENTER {state} · ENTRY LIVE NOW")
+        elif risk_status == "BLOCK":
+            _set(setup, "status", "WAIT")
+            _set(setup, "entry_live", False)
+            _set(report, "entry_live", False)
         return report
 
     def register_signal(
         self,
-        report: TechnicalReport,
+        report: Any,
         signal_time: Any,
         feature_votes: dict[str, int],
         timeframe: str = "M15",
+        delivery_event_id: str | None = None,
+        **_: Any,
     ) -> bool:
-        if not self.enabled or report.active_setup is None or report.market_state not in {"BUY", "SELL"}:
+        """Register only an executable entry; caller controls delivery proof."""
+        if not self.enabled:
             return False
-        if self._same_side_guard(report.market_state, signal_time):
+        state = str(_get(report, "market_state", ""))
+        setup = _get(report, "active_setup")
+        if state not in {"BUY", "SELL"} or setup is None:
             return False
-        setup = report.active_setup
-        signal_time_iso = pd.to_datetime(signal_time, utc=True).isoformat()
-        signal_id = f"{report.symbol}|{timeframe}|{signal_time_iso}|{setup.side}"
-        existing = {row.get("id") for row in self.state.get("signals", [])}
-        if signal_id in existing:
+        if str(_get(setup, "status", "WAIT")) != "ENTER" or not bool(_get(setup, "entry_live", False)):
             return False
-        entry = (setup.entry_low + setup.entry_high) / 2
-        risk = abs(entry - setup.stop_loss)
-        if risk <= 0:
+        entry = _finite(_get(setup, "entry_price"), (_finite(_get(setup, "entry_low")) + _finite(_get(setup, "entry_high"))) / 2.0)
+        stop = _finite(_get(setup, "stop_loss"))
+        tp1 = _finite(_get(setup, "take_profit_1"))
+        if entry <= 0 or stop <= 0 or tp1 <= 0 or abs(entry - stop) < 1e-9:
             return False
-        self.state.setdefault("signals", []).append(
-            {
-                "id": signal_id,
-                "created_at": _utc_now(),
-                "signal_time": signal_time_iso,
-                "symbol": report.symbol,
-                "timeframe": timeframe,
-                "side": setup.side,
-                "entry": entry,
-                "stop": setup.stop_loss,
-                "tp1": setup.take_profit_1,
-                "tp2": setup.take_profit_2,
-                "tp3": setup.take_profit_3,
-                "risk": risk,
-                "confidence": report.confidence,
-                "feature_votes": {name: int(feature_votes.get(name, 0)) for name in FEATURES},
-                "status": "PENDING",
-                "interim_review": "",
-            }
-        )
-        self.state["signals"] = self.state["signals"][-500:]
+        stamp = pd.to_datetime(signal_time, utc=True, errors="coerce")
+        stamp_text = stamp.isoformat() if not pd.isna(stamp) else str(signal_time)
+        raw_key = f"{_get(report, 'symbol', 'XAU/USD')}|{state}|{stamp_text}|{entry:.2f}|{stop:.2f}|{tp1:.2f}"
+        signal_id = hashlib.sha1(raw_key.encode("utf-8")).hexdigest()[:20]
+        if any(row.get("signal_id") == signal_id for row in self.state.get("signals", [])):
+            return False
+        # Do not create overlapping duplicate pending trades on the same side.
+        for row in self.state.get("signals", []):
+            if row.get("status") == "PENDING" and row.get("side") == state:
+                if abs(_finite(row.get("entry")) - entry) <= max(abs(entry - stop) * 0.25, 0.20):
+                    return False
+        record = {
+            "signal_id": signal_id,
+            "delivery_event_id": delivery_event_id,
+            "symbol": str(_get(report, "symbol", "XAU/USD")),
+            "side": state,
+            "status": "PENDING",
+            "signal_time": stamp_text,
+            "opened_at": _utc_now(),
+            "timeframe": timeframe,
+            "entry": round(entry, 6),
+            "entry_low": round(_finite(_get(setup, "entry_low"), entry), 6),
+            "entry_high": round(_finite(_get(setup, "entry_high"), entry), 6),
+            "stop": round(stop, 6),
+            "tp1": round(tp1, 6),
+            "tp2": round(_finite(_get(setup, "take_profit_2"), tp1), 6),
+            "tp3": round(_finite(_get(setup, "take_profit_3"), tp1), 6),
+            "feature_votes": {name: int(feature_votes.get(name, 0)) for name in PILLARS},
+            "setup_type": str(_get(setup, "setup_type", "THREE_PILLAR")),
+            "confidence": int(_finite(_get(report, "confidence"), 0)),
+            "last_price": round(_finite(_get(report, "last_price"), entry), 6),
+        }
+        self.state.setdefault("signals", []).append(record)
+        self.state["signals"] = self.state["signals"][-1000:]
         self.save()
         return True
 
     @staticmethod
-    def _evaluate_signal(signal: dict[str, Any], bars: pd.DataFrame, horizon: int) -> dict[str, Any] | None:
-        if bars.empty:
+    def _evaluate_signal(signal: dict[str, Any], frame: pd.DataFrame, horizon_bars: int) -> dict[str, Any] | None:
+        if frame is None or frame.empty:
             return None
-        frame = bars.copy()
-        frame["time"] = pd.to_datetime(frame["time"], utc=True, errors="coerce")
-        start = pd.to_datetime(signal["signal_time"], utc=True)
-        future = frame[frame["time"] > start].head(horizon)
+        required = {"time", "high", "low", "close"}
+        if not required.issubset(frame.columns):
+            return None
+        data = frame.copy()
+        data["time"] = pd.to_datetime(data["time"], utc=True, errors="coerce")
+        data = data.dropna(subset=["time"]).sort_values("time")
+        start = pd.to_datetime(signal.get("signal_time") or signal.get("opened_at"), utc=True, errors="coerce")
+        if pd.isna(start):
+            return None
+        future = data[data["time"] > start].head(max(1, int(horizon_bars)))
         if future.empty:
             return None
-        side = signal["side"]
-        entry = float(signal["entry"])
-        stop = float(signal["stop"])
-        tp1 = float(signal["tp1"])
-        risk = max(1e-9, float(signal["risk"]))
+        side = str(signal.get("side", "BUY"))
+        entry = _finite(signal.get("entry"))
+        stop = _finite(signal.get("stop"))
+        tp1 = _finite(signal.get("tp1"))
+        risk = abs(entry - stop)
+        if entry <= 0 or risk <= 0 or tp1 <= 0:
+            return None
         mfe = 0.0
         mae = 0.0
         outcome: str | None = None
-        outcome_time = ""
-        outcome_price = None
-        bars_observed = 0
-
-        for index, (_, row) in enumerate(future.iterrows(), start=1):
-            high = float(row["high"])
-            low = float(row["low"])
+        exit_time: str | None = None
+        exit_price: float | None = None
+        bars_seen = 0
+        for _, candle in future.iterrows():
+            bars_seen += 1
+            high = _finite(candle["high"])
+            low = _finite(candle["low"])
             if side == "BUY":
+                mfe = max(mfe, (high - entry) / risk)
+                mae = max(mae, (entry - low) / risk)
                 stop_hit = low <= stop
-                tp_hit = high >= tp1
-                bar_mfe = max(0.0, high - entry)
-                bar_mae = max(0.0, entry - low)
+                target_hit = high >= tp1
             else:
+                mfe = max(mfe, (entry - low) / risk)
+                mae = max(mae, (high - entry) / risk)
                 stop_hit = high >= stop
-                tp_hit = low <= tp1
-                bar_mfe = max(0.0, entry - low)
-                bar_mae = max(0.0, high - entry)
-
-            # Same-bar ambiguity is conservative. Crucially, excursion used for
-            # learning is capped at the first executable exit rather than the
-            # full candle extreme after the trade would already be closed.
+                target_hit = low <= tp1
+            # When one candle contains both levels, choose the conservative result.
             if stop_hit:
-                mae = max(mae, risk)
                 outcome = "LOSS"
-                outcome_price = stop
-                outcome_time = pd.to_datetime(row["time"], utc=True).isoformat()
-                bars_observed = index
-                break
-            if tp_hit:
-                mfe = max(mfe, abs(tp1 - entry))
+                exit_price = stop
+            elif target_hit:
                 outcome = "WIN"
-                outcome_price = tp1
-                outcome_time = pd.to_datetime(row["time"], utc=True).isoformat()
-                bars_observed = index
+                exit_price = tp1
+            if outcome:
+                exit_time = pd.Timestamp(candle["time"]).isoformat()
                 break
-            mfe = max(mfe, bar_mfe)
-            mae = max(mae, bar_mae)
-
-        horizon_mfe = 0.0
-        horizon_mae = 0.0
-        if side == "BUY":
-            horizon_mfe = max(0.0, float(future["high"].max()) - entry)
-            horizon_mae = max(0.0, entry - float(future["low"].min()))
-        else:
-            horizon_mfe = max(0.0, entry - float(future["low"].min()))
-            horizon_mae = max(0.0, float(future["high"].max()) - entry)
-
-        if outcome is None and len(future) >= horizon:
+        if outcome is None and len(future) >= max(1, int(horizon_bars)):
             outcome = "TIMEOUT"
-            outcome_time = pd.to_datetime(future.iloc[-1]["time"], utc=True).isoformat()
-            outcome_price = float(future.iloc[-1]["close"])
-            bars_observed = len(future)
+            last = future.iloc[-1]
+            exit_price = _finite(last["close"], entry)
+            exit_time = pd.Timestamp(last["time"]).isoformat()
         if outcome is None:
-            adverse_r = mae / risk
-            if adverse_r >= 0.50:
-                return {
-                    "interim": True,
-                    "message": f"Adverse excursion reached {adverse_r:.2f}R before resolution; learning weights are not changed until the signal closes.",
-                }
-            return None
-        pre_mfe_r = round(mfe / risk, 4)
-        pre_mae_r = round(mae / risk, 4)
+            return {
+                "interim": True,
+                "message": f"PENDING after {bars_seen} bar(s); MFE {mfe:.2f}R, MAE {mae:.2f}R",
+                "mfe_r": round(max(0.0, mfe), 4),
+                "mae_r": round(max(0.0, mae), 4),
+            }
         return {
             "interim": False,
             "outcome": outcome,
-            "outcome_time": outcome_time,
-            "outcome_price": outcome_price,
-            "mfe_r": pre_mfe_r,
-            "mae_r": pre_mae_r,
-            "pre_exit_mfe_r": pre_mfe_r,
-            "pre_exit_mae_r": pre_mae_r,
-            "horizon_mfe_r": round(horizon_mfe / risk, 4),
-            "horizon_mae_r": round(horizon_mae / risk, 4),
-            "runner_mfe_r": round(horizon_mfe / risk, 4) if outcome == "WIN" else pre_mfe_r,
-            "bars_observed": bars_observed,
+            "exit_time": exit_time,
+            "exit_price": round(float(exit_price or entry), 6),
+            "bars_held": bars_seen,
+            "mfe_r": round(max(0.0, mfe), 4),
+            "mae_r": round(max(0.0, mae), 4),
+            "pre_exit_mfe_r": round(max(0.0, mfe), 4),
+            "runner_mfe_r": round(max(0.0, mfe), 4),
+            "horizon_mfe_r": round(max(0.0, mfe), 4),
+            "message": f"{outcome}: MFE {mfe:.2f}R, MAE {mae:.2f}R after {bars_seen} bar(s)",
         }
 
-    def review_pending(self, bars_by_timeframe: dict[str, pd.DataFrame]) -> list[dict[str, Any]]:
+    def review_pending(self, frames: dict[str, pd.DataFrame]) -> list[dict[str, Any]]:
         if not self.enabled:
             return []
         completed: list[dict[str, Any]] = []
@@ -492,129 +349,147 @@ class AdaptiveEngine:
         for signal in self.state.get("signals", []):
             if signal.get("status") != "PENDING":
                 continue
-            frame = bars_by_timeframe.get(signal.get("timeframe", "M15"))
-            if frame is None:
-                continue
-            review = self._evaluate_signal(signal, frame, self.horizon_bars)
+            # M5 gives better TP/SL ordering resolution; M15 remains fallback.
+            review = None
+            m5 = frames.get("M5")
+            if m5 is not None:
+                review = self._evaluate_signal(signal, m5, self.horizon_bars * 3)
+            if not review or review.get("interim"):
+                m15 = frames.get(signal.get("timeframe", "M15"))
+                if m15 is None:
+                    m15 = frames.get("M15")
+                if m15 is not None:
+                    m15_review = self._evaluate_signal(signal, m15, self.horizon_bars)
+                    if m15_review and not m15_review.get("interim"):
+                        review = m15_review
+                    elif review is None:
+                        review = m15_review
             if not review:
                 continue
             if review.get("interim"):
                 message = str(review.get("message", ""))
-                if message and signal.get("interim_review") != message:
+                if signal.get("interim_review") != message:
                     signal["interim_review"] = message
+                    signal["mfe_r"] = review.get("mfe_r", 0.0)
+                    signal["mae_r"] = review.get("mae_r", 0.0)
                     changed = True
                 continue
-            signal["status"] = review["outcome"]
+            signal["status"] = str(review["outcome"])
             signal["reviewed_at"] = _utc_now()
             signal.update({key: value for key, value in review.items() if key != "interim"})
-            self._update_from_completed(signal)
+            self._learn_from_completed(signal)
             completed.append(deepcopy(signal))
             changed = True
         if changed:
             self.save()
         return completed
 
-    def _update_from_completed(self, signal: dict[str, Any]) -> None:
-        outcome = signal["status"]
+    def _learn_from_completed(self, signal: dict[str, Any]) -> None:
+        outcome = str(signal.get("status", "TIMEOUT"))
+        count_key = "wins" if outcome == "WIN" else "losses" if outcome == "LOSS" else "timeouts"
         counts = self.state.setdefault("counts", {"wins": 0, "losses": 0, "timeouts": 0})
-        if outcome == "WIN":
-            counts["wins"] = int(counts.get("wins", 0)) + 1
-        elif outcome == "LOSS":
-            counts["losses"] = int(counts.get("losses", 0)) + 1
-        else:
-            counts["timeouts"] = int(counts.get("timeouts", 0)) + 1
-        mfe_r = _safe_number(signal.get("pre_exit_mfe_r", signal.get("mfe_r")))
-        if mfe_r is not None:
-            self.state.setdefault("target_mfe_r", []).append(round(max(0.0, min(5.0, mfe_r)), 4))
-            self.state["target_mfe_r"] = self.state["target_mfe_r"][-500:]
-
-        side_sign = 1 if signal["side"] == "BUY" else -1
-        mistake_parts: list[str] = []
+        counts[count_key] = int(counts.get(count_key, 0)) + 1
+        successful: list[str] = []
+        failed: list[str] = []
         if outcome in {"WIN", "LOSS"}:
-            for feature in FEATURES:
-                vote = int(signal.get("feature_votes", {}).get(feature, 0))
+            for pillar in PILLARS:
+                vote = int(signal.get("feature_votes", {}).get(pillar, 0))
                 if vote == 0:
                     continue
-                if feature == "entry_quality":
-                    # Entry quality is non-directional: +1 good, -1 poor.
-                    feature_correct = (outcome == "WIN" and vote > 0) or (outcome == "LOSS" and vote < 0)
-                    aligned = vote > 0
-                else:
-                    aligned = vote == side_sign
-                    feature_correct = (outcome == "WIN" and aligned) or (outcome == "LOSS" and not aligned)
-                item = self.state.setdefault("features", {}).setdefault(
-                    feature, {"alpha": 5.0, "beta": 5.0, "weight": 1.0, "samples": 0}
-                )
+                item = self.state.setdefault("features", {}).setdefault(pillar, _feature_default())
                 item["samples"] = int(item.get("samples", 0)) + 1
-                if feature_correct:
-                    item["alpha"] = float(item.get("alpha", 5.0)) + 1.0
+                correct = outcome == "WIN"  # all stored votes support the delivered side
+                if correct:
+                    item["alpha"] = _finite(item.get("alpha"), 5.0) + 1.0
+                    item["wins"] = int(item.get("wins", 0)) + 1
+                    successful.append(pillar)
                 else:
-                    item["beta"] = float(item.get("beta", 5.0)) + 1.0
-                    if outcome == "LOSS" and aligned:
-                        mistake_parts.append(feature.replace("_", " "))
+                    item["beta"] = _finite(item.get("beta"), 5.0) + 1.0
+                    item["losses"] = int(item.get("losses", 0)) + 1
+                    failed.append(pillar)
                 samples = int(item["samples"])
-                posterior = float(item["alpha"]) / max(1e-9, float(item["alpha"]) + float(item["beta"]))
-                evidence = min(1.0, samples / self.minimum_samples)
-                desired = 1.0 + (posterior - 0.5) * 1.4 * evidence
+                alpha = _finite(item.get("alpha"), 5.0)
+                beta = _finite(item.get("beta"), 5.0)
+                posterior = alpha / max(alpha + beta, 1e-9)
+                # Learning begins immediately, but first-sample evidence is small.
+                evidence = max(0.15, min(1.0, samples / self.minimum_samples))
+                desired = 1.0 + (posterior - 0.5) * 1.20 * evidence
                 desired = max(0.70, min(1.30, desired))
-                old = float(item.get("weight", 1.0))
+                old = _finite(item.get("weight"), 1.0)
                 delta = max(-self.max_weight_change, min(self.max_weight_change, desired - old))
-                item["weight"] = round(old + delta, 4)
-
-        review_text = (
-            f"{signal['side']} signal closed as {outcome}; MFE {float(signal.get('mfe_r', 0)):.2f}R, "
-            f"MAE {float(signal.get('mae_r', 0)):.2f}R."
+                item["weight"] = round(max(0.70, min(1.30, old + delta)), 4)
+        mfe = max(0.0, min(5.0, _finite(signal.get("mfe_r"))))
+        mae = max(0.0, min(5.0, _finite(signal.get("mae_r"))))
+        self.state.setdefault("target_mfe_r", []).append(mfe)
+        self.state["target_mfe_r"] = self.state["target_mfe_r"][-500:]
+        self._adapt_targets(mfe, outcome)
+        pattern_key = f"{signal.get('side', 'NA')}|" + ",".join(
+            f"{name}:{int(signal.get('feature_votes', {}).get(name, 0))}" for name in PILLARS
         )
-        if mistake_parts:
-            review_text += " Aligned feature groups that failed: " + ", ".join(mistake_parts[:5]) + "."
-        elif outcome == "LOSS":
-            review_text += " No single indicator is blamed; the loss is treated as a combined-model error."
-        self.state["last_review"] = review_text
-        self.state.setdefault("reviews", []).append(
-            {
-                "reviewed_at": _utc_now(),
-                "signal_id": signal.get("id"),
-                "outcome": outcome,
-                "mfe_r": signal.get("mfe_r"),
-                "mae_r": signal.get("mae_r"),
-                "summary": review_text,
-            }
+        pattern = self.state.setdefault("patterns", {}).setdefault(
+            pattern_key,
+            {"samples": 0, "wins": 0, "losses": 0, "timeouts": 0, "mfe_sum": 0.0, "mae_sum": 0.0},
         )
-        self.state["reviews"] = self.state["reviews"][-300:]
-
-    def summary(self) -> AdaptiveLearningSummary:
-        counts = self.state.get("counts", {})
-        wins = int(counts.get("wins", 0))
-        losses = int(counts.get("losses", 0))
-        timeouts = int(counts.get("timeouts", 0))
-        reviewed = wins + losses + timeouts
-        decided = wins + losses
-        samples = {
-            name: int(self.state.get("features", {}).get(name, {}).get("samples", 0))
-            for name in FEATURES
+        pattern["samples"] = int(pattern.get("samples", 0)) + 1
+        pattern[count_key] = int(pattern.get(count_key, 0)) + 1
+        pattern["mfe_sum"] = round(_finite(pattern.get("mfe_sum")) + mfe, 4)
+        pattern["mae_sum"] = round(_finite(pattern.get("mae_sum")) + mae, 4)
+        review = {
+            "signal_id": signal.get("signal_id"),
+            "reviewed_at": signal.get("reviewed_at"),
+            "outcome": outcome,
+            "side": signal.get("side"),
+            "setup_type": signal.get("setup_type"),
+            "mfe_r": mfe,
+            "mae_r": mae,
+            "successful_pillars": successful,
+            "failed_pillars": failed,
+            "pattern_key": pattern_key,
+            "weights_after": self.weights(),
+            "targets_after": self.target_multipliers(),
         }
-        return AdaptiveLearningSummary(
-            enabled=self.enabled,
-            reviewed_signals=reviewed,
-            wins=wins,
-            losses=losses,
-            timeouts=timeouts,
-            win_rate=round((wins / decided * 100) if decided else 0.0, 2),
-            indicator_weights=self.weights(),
-            indicator_samples=samples,
-            target_r_multipliers=self.target_multipliers(),
-            last_review=str(self.state.get("last_review", "")),
-            safeguards=[
-                f"Feature weights remain at prior values until evidence accumulates; full adaptation begins near {self.minimum_samples} observations per feature.",
-                f"A single completed signal can move a feature weight by no more than {self.max_weight_change:.2f}.",
-                "Adverse movement is reviewed immediately, but weights change only after TP1, SL, or the fixed outcome horizon.",
-                "Weights are bounded between 0.70 and 1.30; the program never rewrites its own source code.",
-                f"Directional confidence is capped at {self.confidence_cap()}% while the reviewed sample is small.",
-                "Duplicate pending signals, post-loss cooldowns and weak entries without two-of-three pillar confirmation are blocked.",
-                "Target learning uses pre-exit excursion; full candle movement after an exit cannot inflate future targets.",
-            ],
+        self.state.setdefault("reviews", []).append(review)
+        self.state["reviews"] = self.state["reviews"][-1000:]
+        self.state["last_review"] = (
+            f"{outcome} {signal.get('side')} · MFE {mfe:.2f}R · MAE {mae:.2f}R · "
+            f"successful: {', '.join(successful) or 'none'} · failed: {', '.join(failed) or 'none'}"
         )
 
-    def reset(self) -> None:
-        self.state = _default_state()
-        self.save()
+    def _adapt_targets(self, mfe: float, outcome: str) -> None:
+        current = self.target_multipliers()
+        if outcome == "WIN":
+            desired_tp1 = max(0.60, min(0.85, mfe * 0.85))
+            desired_tp2 = max(desired_tp1 + 0.20, min(1.25, mfe * 1.10))
+            desired_tp3 = max(desired_tp2 + 0.20, min(1.70, mfe * 1.35))
+        else:
+            desired_tp1 = max(0.60, min(current["tp1"], max(0.60, mfe * 0.90)))
+            desired_tp2 = max(desired_tp1 + 0.20, min(current["tp2"], max(desired_tp1 + 0.20, mfe * 1.10)))
+            desired_tp3 = max(desired_tp2 + 0.20, min(current["tp3"], max(desired_tp2 + 0.20, mfe * 1.30)))
+        desired = {"tp1": desired_tp1, "tp2": desired_tp2, "tp3": desired_tp3}
+        updated: dict[str, float] = {}
+        for key in ("tp1", "tp2", "tp3"):
+            delta = max(-0.05, min(0.05, desired[key] - current[key]))
+            updated[key] = round(current[key] + delta, 2)
+        updated["tp1"] = max(0.60, min(0.90, updated["tp1"]))
+        updated["tp2"] = max(updated["tp1"] + 0.20, min(1.35, updated["tp2"]))
+        updated["tp3"] = max(updated["tp2"] + 0.20, min(1.80, updated["tp3"]))
+        self.state["target_multipliers"] = updated
+
+    def pending_near_exit(self, current_price: float, fraction: float = 0.25) -> bool:
+        price = float(current_price)
+        for row in self.state.get("signals", []):
+            if row.get("status") != "PENDING":
+                continue
+            entry = _finite(row.get("entry"))
+            stop = _finite(row.get("stop"))
+            tp1 = _finite(row.get("tp1"))
+            risk = abs(entry - stop)
+            if risk <= 0:
+                continue
+            threshold = max(risk * max(0.10, fraction), 0.20)
+            if abs(price - stop) <= threshold or abs(price - tp1) <= threshold:
+                return True
+        return False
+
+    def pending_trade_count(self) -> int:
+        return sum(1 for row in self.state.get("signals", []) if row.get("status") == "PENDING")

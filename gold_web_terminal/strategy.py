@@ -1,621 +1,521 @@
 from __future__ import annotations
 
-import math
+"""AurumEdge v5.8.1 three-pillar decision engine.
+
+Only market structure, anchored VWAP and volume profile vote BUY or SELL.
+ATR is used only for entry tolerance, invalidation, targets and risk geometry.
+Macro, EMA, RSI, MACD, ADX/DMI, raw volume, FVG and liquidity labels cannot
+block, reverse or create a directional signal in this module.
+"""
+
 from datetime import datetime, timedelta, timezone
-from typing import Any
+import math
+from statistics import median
+from typing import Any, Iterable
 
-from .models import (
-    AdaptiveLearningSummary,
-    IndicatorSnapshot,
-    LiquiditySnapshot,
-    MacroConfirmation,
-    TechnicalReport,
-    TradeSetup,
+try:  # Existing repository model; kept untouched by this patch.
+    from .models import TechnicalReport
+except Exception:  # pragma: no cover - compatibility fallback for validation.
+    TechnicalReport = None  # type: ignore[assignment]
+
+
+PILLARS = ("market_structure", "anchored_vwap", "volume_profile")
+LEGACY_FEATURES = (
+    "ema_trend",
+    "rsi",
+    "macd",
+    "adx_dmi",
+    "ordinary_volume",
+    "supertrend",
+    "liquidity",
+    "fvg",
+    "macro",
 )
-from .risk_engine import RiskInputs, build_position_risk_plan
 
 
-TF_WEIGHTS = {"M5": 0.08, "M15": 0.22, "H1": 0.34, "H4": 0.26, "D1": 0.10}
-DEFAULT_ADAPTIVE_WEIGHTS = {
-    "market_structure": 1.0,
-    "anchored_vwap": 1.0,
-    "volume_profile": 1.0,
-    "entry_quality": 1.0,
-}
+class AttrMap(dict):
+    """JSON-friendly mapping with attribute access for old UI/model code."""
+
+    __getattr__ = dict.get
+
+    def __setattr__(self, key: str, value: Any) -> None:
+        self[key] = value
 
 
-def _round_price(value: float, digits: int) -> float:
-    return round(float(value), digits)
+def _finite(value: Any, default: float | None = None) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    return number if math.isfinite(number) else default
 
 
-def _rr(entry: float, stop: float, target: float) -> float:
-    risk = abs(entry - stop)
-    return 0.0 if risk <= 0 else round(abs(target - entry) / risk, 2)
+def _get(obj: Any, *names: str, default: Any = None) -> Any:
+    for name in names:
+        if isinstance(obj, dict) and name in obj:
+            value = obj[name]
+        else:
+            value = getattr(obj, name, None)
+        if value is not None:
+            return value
+    return default
 
 
-def _select_snapshot(indicators: list[IndicatorSnapshot], timeframe: str) -> IndicatorSnapshot:
-    return next((item for item in indicators if item.timeframe == timeframe), indicators[0])
+def _number(obj: Any, *names: str, default: float | None = None) -> float | None:
+    return _finite(_get(obj, *names, default=default), default)
 
 
-def _weight(weights: dict[str, float], key: str) -> float:
-    return max(0.70, min(1.30, float(weights.get(key, 1.0))))
+def _text(obj: Any, *names: str, default: str = "") -> str:
+    value = _get(obj, *names, default=default)
+    return str(value or default).strip()
 
 
-def _pillar_vote(item: IndicatorSnapshot) -> tuple[int, int, int]:
-    """Return structure, anchored-VWAP and volume-profile votes (-1/0/+1)."""
-    structure = 0
-    if item.market_structure in {"BOS_UP", "CHOCH_UP"} or item.structure_bias == "bullish":
-        structure = 1
-    elif item.market_structure in {"BOS_DOWN", "CHOCH_DOWN"} or item.structure_bias == "bearish":
-        structure = -1
-
-    avwap = 0
-    if item.avwap_active is not None:
-        slope = float(item.avwap_slope_atr or 0.0)
-        if item.close > float(item.avwap_active) and slope >= -0.03:
-            avwap = 1
-        elif item.close < float(item.avwap_active) and slope <= 0.03:
-            avwap = -1
-
-    profile = 0
-    if item.profile_acceptance == "bullish" or item.profile_state == "ABOVE_VALUE":
-        profile = 1
-    elif item.profile_acceptance == "bearish" or item.profile_state == "BELOW_VALUE":
-        profile = -1
-    elif item.profile_poc is not None:
-        distance = item.close - float(item.profile_poc)
-        atr = max(float(item.atr14 or 0.0), 1e-9)
-        if distance >= atr * 0.10:
-            profile = 1
-        elif distance <= -atr * 0.10:
-            profile = -1
-    return structure, avwap, profile
+def _snapshot(items: Iterable[Any], timeframe: str) -> Any | None:
+    tf = timeframe.upper()
+    return next((item for item in items if _text(item, "timeframe").upper() == tf), None)
 
 
-def _weighted_market_scores(
-    indicators: list[IndicatorSnapshot], adaptive_weights: dict[str, float]
-) -> tuple[float, float, list[str], list[str]]:
-    """Score only the three requested pillars.
+def _construct_report(values: dict[str, Any]) -> Any:
+    """Build the repository TechnicalReport without requiring model changes."""
+    if TechnicalReport is None:
+        return AttrMap(values)
+    try:
+        if hasattr(TechnicalReport, "model_construct"):
+            report = TechnicalReport.model_construct(**values)
+        else:  # Pydantic v1
+            report = TechnicalReport.construct(**values)
+        for key, value in values.items():
+            try:
+                object.__setattr__(report, key, value)
+            except Exception:
+                try:
+                    setattr(report, key, value)
+                except Exception:
+                    pass
+        return report
+    except Exception:
+        return AttrMap(values)
 
-    Market structure carries 45%, anchored VWAP 35%, and volume profile 20%.
-    No EMA, MACD, RSI, ADX, liquidity-sweep or macro vote can change direction.
-    """
-    bullish = 0.0
-    bearish = 0.0
-    buy_reasons: list[str] = []
-    sell_reasons: list[str] = []
-    for item in indicators:
-        tf_weight = TF_WEIGHTS.get(item.timeframe, 0.1)
-        structure, avwap, profile = _pillar_vote(item)
-        components = (
-            (structure, 45.0 * tf_weight * _weight(adaptive_weights, "market_structure"), "market structure"),
-            (avwap, 35.0 * tf_weight * _weight(adaptive_weights, "anchored_vwap"), "anchored VWAP"),
-            (profile, 20.0 * tf_weight * _weight(adaptive_weights, "volume_profile"), "volume profile"),
+
+def _structure_vote(item: Any) -> int:
+    bias = _text(item, "structure_bias", "swing_bias", "market_bias").lower()
+    state = _text(item, "market_structure", "structure_state", "structure").upper()
+    if bias in {"bullish", "buy", "up"} or any(token in state for token in ("BOS_UP", "CHOCH_UP", "HH", "HL", "BULL")):
+        return 1
+    if bias in {"bearish", "sell", "down"} or any(token in state for token in ("BOS_DOWN", "CHOCH_DOWN", "LH", "LL", "BEAR")):
+        return -1
+    return 0
+
+
+def _avwap_value(item: Any) -> float | None:
+    return _number(
+        item,
+        "anchored_vwap",
+        "active_anchored_vwap",
+        "active_avwap",
+        "avwap",
+        "swing_anchored_vwap",
+        "vwap",
+    )
+
+
+def _avwap_slope(item: Any) -> float:
+    return float(
+        _number(
+            item,
+            "anchored_vwap_slope",
+            "active_avwap_slope",
+            "avwap_slope",
+            "vwap_slope",
+            default=0.0,
         )
-        for vote, points, label in components:
-            if vote > 0:
-                bullish += points
-                buy_reasons.append(f"{item.timeframe}: {label} confirms buyers")
-            elif vote < 0:
-                bearish += points
-                sell_reasons.append(f"{item.timeframe}: {label} confirms sellers")
-    return bullish, bearish, buy_reasons, sell_reasons
+        or 0.0
+    )
 
 
-def _market_stats(indicators: list[IndicatorSnapshot]) -> dict[str, float | int | bool]:
-    """Price-action statistics used for timing/risk, not directional voting."""
-    m15 = _select_snapshot(indicators, "M15")
-    h1 = _select_snapshot(indicators, "H1")
-    structure_up = bool(
-        m15.structure_break_up
-        or m15.market_structure in {"BOS_UP", "CHOCH_UP"}
-        or h1.market_structure == "BOS_UP"
-    )
-    structure_down = bool(
-        m15.structure_break_down
-        or m15.market_structure in {"BOS_DOWN", "CHOCH_DOWN"}
-        or h1.market_structure == "BOS_DOWN"
-    )
+def _avwap_vote(item: Any, price: float) -> int:
+    explicit = _text(item, "anchored_vwap_bias", "avwap_bias").lower()
+    if explicit in {"bullish", "buy", "above", "up"}:
+        return 1
+    if explicit in {"bearish", "sell", "below", "down"}:
+        return -1
+    value = _avwap_value(item)
+    if value is None:
+        return 0
+    slope = _avwap_slope(item)
+    tolerance = max(abs(price) * 0.00003, 0.05)
+    if price > value + tolerance and slope >= -tolerance * 0.1:
+        return 1
+    if price < value - tolerance and slope <= tolerance * 0.1:
+        return -1
+    if slope > tolerance * 0.1:
+        return 1
+    if slope < -tolerance * 0.1:
+        return -1
+    return 0
+
+
+def _profile_values(item: Any) -> tuple[float | None, float | None, float | None]:
+    poc = _number(item, "profile_poc", "volume_profile_poc", "poc", "value_poc")
+    vah = _number(item, "profile_vah", "volume_profile_vah", "vah", "value_area_high")
+    val = _number(item, "profile_val", "volume_profile_val", "val", "value_area_low")
+    return poc, vah, val
+
+
+def _profile_vote(item: Any, price: float) -> int:
+    explicit = _text(item, "profile_bias", "volume_profile_bias", "profile_acceptance").lower()
+    if any(token in explicit for token in ("above", "bull", "buy", "up acceptance")):
+        return 1
+    if any(token in explicit for token in ("below", "bear", "sell", "down acceptance")):
+        return -1
+    poc, vah, val = _profile_values(item)
+    if vah is not None and price > vah:
+        return 1
+    if val is not None and price < val:
+        return -1
+    if poc is not None:
+        tolerance = max(abs(price) * 0.00003, 0.05)
+        if price > poc + tolerance:
+            return 1
+        if price < poc - tolerance:
+            return -1
+    return 0
+
+
+def _timeframe_votes(item: Any, price: float) -> dict[str, int]:
+    if item is None:
+        return {name: 0 for name in PILLARS}
     return {
-        "breakout_up": structure_up,
-        "breakout_down": structure_down,
+        "market_structure": _structure_vote(item),
+        "anchored_vwap": _avwap_vote(item, price),
+        "volume_profile": _profile_vote(item, price),
     }
 
 
-def _timeframe_alignment(indicators: list[IndicatorSnapshot]) -> dict[str, int]:
-    bullish = 0
-    bearish = 0
-    neutral = 0
-    for timeframe in ("M15", "H1", "H4", "D1"):
-        item = next((row for row in indicators if row.timeframe == timeframe), None)
-        if item is None:
-            continue
-        votes = _pillar_vote(item)
-        score = sum(votes)
-        if score >= 1:
-            bullish += 1
-        elif score <= -1:
-            bearish += 1
+def _aggregate_pillars(indicators: list[Any], price: float) -> tuple[dict[str, int], dict[str, dict[str, int]]]:
+    per_tf = {
+        tf: _timeframe_votes(_snapshot(indicators, tf), price)
+        for tf in ("M15", "H1")
+    }
+    result: dict[str, int] = {}
+    for pillar in PILLARS:
+        m15 = per_tf["M15"][pillar]
+        h1 = per_tf["H1"][pillar]
+        total = m15 + h1
+        if total > 0:
+            result[pillar] = 1
+        elif total < 0:
+            result[pillar] = -1
         else:
-            neutral += 1
-    return {"bullish": bullish, "bearish": bearish, "neutral": neutral}
+            result[pillar] = h1 or m15
+    return result, per_tf
 
 
-def _liquidity_context(liquidity: list[LiquiditySnapshot], price: float) -> dict[str, Any]:
-    supports: list[float] = []
-    resistances: list[float] = []
-    bull_traps: list[str] = []
-    bear_traps: list[str] = []
-    for item in liquidity:
-        for zone in item.support_zones:
-            for key in ("upper", "center", "lower"):
-                value = zone.get(key)
-                if value is not None and float(value) < price:
-                    supports.append(float(value))
-        for zone in item.resistance_zones:
-            for key in ("lower", "center", "upper"):
-                value = zone.get(key)
-                if value is not None and float(value) > price:
-                    resistances.append(float(value))
-        for level in (item.previous_day_low, item.value_area_low, item.point_of_control, *item.recent_swing_lows):
-            if level is not None and level < price:
-                supports.append(float(level))
-        for level in (item.previous_day_high, item.value_area_high, item.point_of_control, *item.recent_swing_highs):
-            if level is not None and level > price:
-                resistances.append(float(level))
-        if item.trap_type == "bull_trap" or item.sweep_above is not None:
-            bull_traps.append(item.timeframe)
-        if item.trap_type == "bear_trap" or item.sweep_below is not None:
-            bear_traps.append(item.timeframe)
-    active_timeframes = {"M15", "H1"}
+def _adaptive_weight(weights: dict[str, float] | None, pillar: str) -> float:
+    if not weights:
+        return 1.0
+    value = _finite(weights.get(pillar), 1.0)
+    return max(0.70, min(1.30, float(value or 1.0)))
 
-    def _fresh(item: LiquiditySnapshot, side: str) -> bool:
-        age = item.sweep_above_age if side == "above" else item.sweep_below_age
-        if age is None:
-            return False
-        # M15 traps may affect the current and immediately following candle.
-        # H1 traps affect only the current H1 candle.  Older sweeps remain chart
-        # context but must not freeze execution for hours.
-        return age <= (1 if item.timeframe == "M15" else 0)
 
-    bull_trap_levels = {
-        item.timeframe: float(item.sweep_above)
-        for item in liquidity
-        if item.timeframe in active_timeframes and item.sweep_above is not None and _fresh(item, "above")
+def _direction(pillars: dict[str, int], weights: dict[str, float] | None) -> tuple[str, float, float]:
+    buy = sum(_adaptive_weight(weights, key) for key, vote in pillars.items() if vote > 0)
+    sell = sum(_adaptive_weight(weights, key) for key, vote in pillars.items() if vote < 0)
+    buy_count = sum(vote > 0 for vote in pillars.values())
+    sell_count = sum(vote < 0 for vote in pillars.values())
+    if buy_count >= 2 and buy > sell:
+        return "BUY", buy, sell
+    if sell_count >= 2 and sell > buy:
+        return "SELL", buy, sell
+    return "STUCK", buy, sell
+
+
+def _atr(indicators: list[Any], price: float) -> float:
+    for tf in ("M15", "H1", "M5"):
+        item = _snapshot(indicators, tf)
+        value = _number(item, "atr14", "atr", "average_true_range") if item is not None else None
+        if value and value > 0:
+            return float(value)
+    return max(abs(price) * 0.00035, 0.75)
+
+
+def _level_candidates(item: Any) -> dict[str, float]:
+    if item is None:
+        return {}
+    candidates: dict[str, float] = {}
+    mapping = {
+        "avwap": ("anchored_vwap", "active_anchored_vwap", "active_avwap", "avwap", "vwap"),
+        "poc": ("profile_poc", "volume_profile_poc", "poc"),
+        "vah": ("profile_vah", "volume_profile_vah", "vah", "value_area_high"),
+        "val": ("profile_val", "volume_profile_val", "val", "value_area_low"),
+        "swing_high": ("last_swing_high", "swing_high", "structure_high", "recent_swing_high"),
+        "swing_low": ("last_swing_low", "swing_low", "structure_low", "recent_swing_low"),
     }
-    bear_trap_levels = {
-        item.timeframe: float(item.sweep_below)
-        for item in liquidity
-        if item.timeframe in active_timeframes and item.sweep_below is not None and _fresh(item, "below")
-    }
-    bull_trap_ages = {
-        item.timeframe: int(item.sweep_above_age)
-        for item in liquidity
-        if item.timeframe in bull_trap_levels and item.sweep_above_age is not None
-    }
-    bear_trap_ages = {
-        item.timeframe: int(item.sweep_below_age)
-        for item in liquidity
-        if item.timeframe in bear_trap_levels and item.sweep_below_age is not None
-    }
-    two_sided_timeframes = sorted(set(bull_trap_levels) & set(bear_trap_levels))
-    return {
-        "supports": sorted(set(round(level, 5) for level in supports), reverse=True),
-        "resistances": sorted(set(round(level, 5) for level in resistances)),
-        "nearest_support": max(supports) if supports else None,
-        "nearest_resistance": min(resistances) if resistances else None,
-        # All-timeframe lists remain useful as context and chart labels.  The
-        # execution classifier below only treats fresh M15/H1 sweeps as a trap.
-        "bull_traps": bull_traps,
-        "bear_traps": bear_traps,
-        "bull_trap_levels": bull_trap_levels,
-        "bear_trap_levels": bear_trap_levels,
-        "bull_trap_ages": bull_trap_ages,
-        "bear_trap_ages": bear_trap_ages,
-        "two_sided_timeframes": two_sided_timeframes,
-    }
+    for name, aliases in mapping.items():
+        value = _number(item, *aliases)
+        if value is not None:
+            candidates[name] = float(value)
+    return candidates
 
 
-def _entry_candidate(
-    side: str,
-    price: float,
-    m15: IndicatorSnapshot,
-    h1: IndicatorSnapshot,
-    supports: list[float],
-    resistances: list[float],
-    regime: str,
-) -> tuple[float, str]:
-    h1_atr = float(h1.atr14 or m15.atr14 or price * 0.002)
-    m15_atr = float(m15.atr14 or h1_atr * 0.5)
-    if "breakout" in regime:
-        return price, "LIVE THREE-PILLAR BREAKOUT"
-
-    m15_votes = _pillar_vote(m15)
-    h1_votes = _pillar_vote(h1)
-    side_sign = 1 if side == "BUY" else -1
-    m15_confirmations = sum(vote == side_sign for vote in m15_votes)
-    h1_confirmations = sum(vote == side_sign for vote in h1_votes)
-    reference = m15.avwap_active or m15.profile_poc or h1.avwap_active or h1.profile_poc
-    distance_from_value = abs(price - float(reference)) if reference is not None else 0.0
-
-    # This is the responsive continuation path. It prevents the terminal from
-    # waiting through an entire $50-$100 move when all three pillars have
-    # already aligned. It is still blocked when price is excessively extended.
-    if m15_confirmations >= 2 and h1_confirmations >= 2 and distance_from_value <= m15_atr * 1.20:
-        return price, "LIVE THREE-PILLAR CONTINUATION"
-
-    if side == "BUY":
-        candidates = [level for level in supports if price - h1_atr * 0.85 <= level <= price]
-        for level in (m15.avwap_active, h1.avwap_active, m15.profile_poc, h1.profile_poc, m15.profile_val):
-            if level is not None and price - h1_atr * 0.85 <= level <= price:
-                candidates.append(float(level))
-        if candidates:
-            level = max(candidates)
-            if price - level <= m15_atr * 0.35:
-                return price, "LIVE THREE-PILLAR VALUE RECLAIM"
-            return level + m15_atr * 0.05, "PULLBACK TO AVWAP / PROFILE VALUE"
+def _risk_plan(side: str, entry: float, stop: float, risk_inputs: Any | None) -> AttrMap:
+    distance = max(abs(entry - stop), 0.01)
+    balance = float(_number(risk_inputs, "account_balance", default=10000.0) or 10000.0)
+    risk_percent = float(_number(risk_inputs, "risk_percent", default=1.0) or 1.0)
+    requested = float(_number(risk_inputs, "requested_lot", default=0.10) or 0.10)
+    contract = float(_number(risk_inputs, "contract_size", default=100.0) or 100.0)
+    step = max(float(_number(risk_inputs, "lot_step", default=0.01) or 0.01), 0.001)
+    minimum = max(float(_number(risk_inputs, "min_lot", default=0.01) or 0.01), step)
+    max_dollars = float(_number(risk_inputs, "maximum_risk_dollars", default=0.0) or 0.0)
+    risk_budget = balance * risk_percent / 100.0
+    if max_dollars > 0:
+        risk_budget = min(risk_budget, max_dollars)
+    one_lot_loss = distance * contract
+    raw_lot = risk_budget / one_lot_loss if one_lot_loss > 0 else 0.0
+    recommended = math.floor(raw_lot / step + 1e-9) * step
+    recommended = round(max(0.0, recommended), 4)
+    estimated = requested * one_lot_loss
+    if recommended < minimum:
+        status = "BLOCK"
+        recommended = 0.0
+    elif requested <= recommended + step * 0.25:
+        status = "OK"
     else:
-        candidates = [level for level in resistances if price <= level <= price + h1_atr * 0.85]
-        for level in (m15.avwap_active, h1.avwap_active, m15.profile_poc, h1.profile_poc, m15.profile_vah):
-            if level is not None and price <= level <= price + h1_atr * 0.85:
-                candidates.append(float(level))
-        if candidates:
-            level = min(candidates)
-            if level - price <= m15_atr * 0.35:
-                return price, "LIVE THREE-PILLAR VALUE REJECTION"
-            return level - m15_atr * 0.05, "PULLBACK TO AVWAP / PROFILE VALUE"
-    return price, "LIVE THREE-PILLAR MARKET ZONE"
+        status = "REDUCE_LOT"
+    return AttrMap(
+        status=status,
+        side=side,
+        requested_lot=round(requested, 4),
+        recommended_lot=recommended,
+        estimated_loss_requested_lot=round(estimated, 2),
+        risk_budget=round(risk_budget, 2),
+        stop_distance=round(distance, 4),
+    )
 
 
-def _nearest_below(levels: list[float], price: float) -> float | None:
-    eligible = [level for level in levels if level < price]
-    return max(eligible) if eligible else None
-
-
-def _nearest_above(levels: list[float], price: float) -> float | None:
-    eligible = [level for level in levels if level > price]
-    return min(eligible) if eligible else None
-
-
-def _target_before_level(side: str, raw: float, levels: list[float], entry: float, buffer: float) -> float:
-    if side == "BUY":
-        level = _nearest_above(levels, entry)
-        if level is not None and level < raw:
-            return max(entry + buffer, level - buffer)
-        return raw
-    level = _nearest_below(levels, entry)
-    if level is not None and level > raw:
-        return min(entry - buffer, level + buffer)
-    return raw
-
-
-def _build_setup(
+def _entry_geometry(
     side: str,
     price: float,
-    h1_atr: float,
-    m15_atr: float,
-    confidence: int,
-    supports: list[float],
-    resistances: list[float],
+    indicators: list[Any],
+    pillars: dict[str, int],
+    per_tf: dict[str, dict[str, int]],
+    risk_inputs: Any | None,
+    targets: dict[str, float] | None,
     digits: int,
-    active: bool,
-    reasons: list[str],
-    data_source: str,
-    m15: IndicatorSnapshot,
-    h1: IndicatorSnapshot,
-    regime: str,
-    risk_inputs: RiskInputs,
-    target_multipliers: dict[str, float],
-) -> TradeSetup:
-    entry_mid, entry_type = _entry_candidate(side, price, m15, h1, supports, resistances, regime)
-    entry_half_width = max(0.06 * m15_atr, 0.05)
-    entry_low = entry_mid - entry_half_width
-    entry_high = entry_mid + entry_half_width
-    min_stop_distance = max(risk_inputs.minimum_stop_atr * m15_atr, risk_inputs.spread_price * 2.2, 0.40)
-    max_normal_distance = max(risk_inputs.maximum_stop_atr * h1_atr, min_stop_distance)
-    buffer = max(0.14 * m15_atr, risk_inputs.spread_price * 1.5, 0.25)
-    common_warnings = [
-        "This is indicative decision support, not an executable broker quote.",
-        "The lot recommendation assumes the configured contract size; verify the broker symbol specification.",
-    ]
-    if data_source == "DEMO":
-        common_warnings.append("Demo data is synthetic and must not be used for live trading.")
+) -> AttrMap:
+    m15 = _snapshot(indicators, "M15")
+    h1 = _snapshot(indicators, "H1")
+    atr = _atr(indicators, price)
+    m15_levels = _level_candidates(m15)
+    h1_levels = _level_candidates(h1)
+    levels = {**h1_levels, **m15_levels}
+    sign = 1 if side == "BUY" else -1
+    aligned = sum(vote == sign for vote in pillars.values())
+    tf_alignment = sum(per_tf[tf][pillar] == sign for tf in per_tf for pillar in PILLARS)
+    avwap = m15_levels.get("avwap") or h1_levels.get("avwap")
+    poc = m15_levels.get("poc") or h1_levels.get("poc")
+    reference = median([value for value in (avwap, poc) if value is not None]) if any(value is not None for value in (avwap, poc)) else price
+    extension = abs(price - reference) / max(atr, 1e-9)
+    structure_text = _text(m15, "market_structure", "structure_state").upper()
+    fresh_break = (side == "BUY" and any(token in structure_text for token in ("BOS_UP", "CHOCH_UP"))) or (
+        side == "SELL" and any(token in structure_text for token in ("BOS_DOWN", "CHOCH_DOWN"))
+    )
+    continuation_live = aligned == 3 or (aligned >= 2 and tf_alignment >= 4 and extension <= 0.85)
+    immediate = fresh_break or continuation_live
+    zone_half = max(atr * 0.12, abs(price) * 0.00004, 0.12)
+    if immediate:
+        entry_mid = price
+        setup_type = "BREAKOUT" if fresh_break else "CONTINUATION"
+    else:
+        if side == "BUY":
+            supports = [
+                value
+                for key, value in levels.items()
+                if key in {"avwap", "poc", "vah", "val", "swing_high", "swing_low"}
+                and value <= price + atr * 0.20
+            ]
+            entry_mid = max(supports) if supports else price - atr * 0.35
+        else:
+            resistances = [
+                value
+                for key, value in levels.items()
+                if key in {"avwap", "poc", "vah", "val", "swing_high", "swing_low"}
+                and value >= price - atr * 0.20
+            ]
+            entry_mid = min(resistances) if resistances else price + atr * 0.35
+        setup_type = "PULLBACK"
+    entry_low = entry_mid - zone_half
+    entry_high = entry_mid + zone_half
 
     if side == "BUY":
-        structural = _nearest_below(supports, entry_mid)
-        if structural is not None:
-            stop = structural - buffer
-            stop_basis = f"Below the nearest valid support/liquidity structure at {structural:.2f}, plus a volatility/spread buffer."
-        else:
-            stop = entry_mid - max(0.85 * h1_atr, min_stop_distance)
-            stop_basis = "No close support was available; stop uses a conservative ATR invalidation distance."
-        if entry_mid - stop < min_stop_distance:
-            stop = entry_mid - min_stop_distance
-        stop_distance = entry_mid - stop
-        if stop_distance > max_normal_distance:
-            common_warnings.append(
-                "The nearest structural invalidation is unusually far from entry. The engine keeps the structural stop and reduces lot size instead of placing a false tight stop."
-            )
-        risk = max(stop_distance, 1e-9)
-        distances = {
-            "tp1": min(risk * target_multipliers["tp1"], h1_atr * 0.90),
-            "tp2": min(risk * target_multipliers["tp2"], h1_atr * 1.35),
-            "tp3": min(risk * target_multipliers["tp3"], h1_atr * 1.85),
-        }
-        tp1 = _target_before_level("BUY", entry_mid + distances["tp1"], resistances, entry_mid, buffer * 0.45)
-        tp2 = _target_before_level("BUY", entry_mid + distances["tp2"], [x for x in resistances if x > tp1], entry_mid, buffer * 0.45)
-        tp3 = _target_before_level("BUY", entry_mid + distances["tp3"], [x for x in resistances if x > tp2], entry_mid, buffer * 0.45)
-        tp2 = max(tp2, tp1 + max(m15_atr * 0.25, 0.50))
-        tp3 = max(tp3, tp2 + max(m15_atr * 0.30, 0.70))
-        invalidation = f"M15 closes below {_round_price(stop, digits)}; H1 structure must also be reviewed."
+        below = [
+            value
+            for key, value in m15_levels.items()
+            if key in {"avwap", "val", "poc", "swing_low"} and value < entry_mid
+        ]
+        structural = max(below) - atr * 0.10 if below else entry_mid - atr * 0.85
+        raw_distance = entry_mid - structural
     else:
-        structural = _nearest_above(resistances, entry_mid)
-        if structural is not None:
-            stop = structural + buffer
-            stop_basis = f"Above the nearest valid resistance/liquidity structure at {structural:.2f}, plus a volatility/spread buffer."
-        else:
-            stop = entry_mid + max(0.85 * h1_atr, min_stop_distance)
-            stop_basis = "No close resistance was available; stop uses a conservative ATR invalidation distance."
-        if stop - entry_mid < min_stop_distance:
-            stop = entry_mid + min_stop_distance
-        stop_distance = stop - entry_mid
-        if stop_distance > max_normal_distance:
-            common_warnings.append(
-                "The nearest structural invalidation is unusually far from entry. The engine keeps the structural stop and reduces lot size instead of placing a false tight stop."
-            )
-        risk = max(stop_distance, 1e-9)
-        distances = {
-            "tp1": min(risk * target_multipliers["tp1"], h1_atr * 0.90),
-            "tp2": min(risk * target_multipliers["tp2"], h1_atr * 1.35),
-            "tp3": min(risk * target_multipliers["tp3"], h1_atr * 1.85),
-        }
-        tp1 = _target_before_level("SELL", entry_mid - distances["tp1"], supports, entry_mid, buffer * 0.45)
-        tp2 = _target_before_level("SELL", entry_mid - distances["tp2"], [x for x in supports if x < tp1], entry_mid, buffer * 0.45)
-        tp3 = _target_before_level("SELL", entry_mid - distances["tp3"], [x for x in supports if x < tp2], entry_mid, buffer * 0.45)
-        tp2 = min(tp2, tp1 - max(m15_atr * 0.25, 0.50))
-        tp3 = min(tp3, tp2 - max(m15_atr * 0.30, 0.70))
-        invalidation = f"M15 closes above {_round_price(stop, digits)}; H1 structure must also be reviewed."
+        above = [
+            value
+            for key, value in m15_levels.items()
+            if key in {"avwap", "vah", "poc", "swing_high"} and value > entry_mid
+        ]
+        structural = min(above) + atr * 0.10 if above else entry_mid + atr * 0.85
+        raw_distance = structural - entry_mid
 
-    risk_plan = build_position_risk_plan(entry_mid, stop, risk_inputs)
-    status_active = active and risk_plan.status != "NO_TRADE"
-    if risk_plan.status == "REDUCE_LOT":
-        common_warnings.append(risk_plan.message)
-    elif risk_plan.status == "NO_TRADE":
-        common_warnings.append(risk_plan.message)
+    minimum_atr = float(_number(risk_inputs, "minimum_stop_atr", default=0.55) or 0.55)
+    maximum_atr = float(_number(risk_inputs, "maximum_stop_atr", default=1.60) or 1.60)
+    minimum_atr = max(0.45, minimum_atr)
+    maximum_atr = max(minimum_atr + 0.10, min(1.80, maximum_atr))
+    stop_distance = min(max(raw_distance, atr * minimum_atr), atr * maximum_atr)
+    stop = entry_mid - stop_distance if side == "BUY" else entry_mid + stop_distance
 
-    valid_until = (datetime.now(timezone.utc) + timedelta(minutes=45)).strftime("%Y-%m-%d %H:%M UTC")
-    target_basis = (
-        f"Targets use adaptive reachable-range multipliers {target_multipliers['tp1']:.2f}R / "
-        f"{target_multipliers['tp2']:.2f}R / {target_multipliers['tp3']:.2f}R, capped by H1 ATR and placed before nearby structure/profile levels."
-    )
-    management = [
-        "Do not chase outside the entry zone; recalculate if price moves more than 0.35 M15 ATR away.",
-        "At TP1, take partial profit. Move the stop to breakeven only after an M15 close confirms continuation, not on a wick touch.",
-        "TP3 is a runner target; cancel it when market structure breaks against the trade or price loses anchored VWAP/value acceptance.",
-    ]
-    if risk_plan.status == "REDUCE_LOT":
-        management.insert(0, f"Use approximately {risk_plan.recommended_lot:.2f} lot or less; the requested lot exceeds the risk budget.")
-
-    return TradeSetup(
-        side=side,  # type: ignore[arg-type]
-        status="ENTER" if status_active else "NO_TRADE",
-        confidence=confidence,
-        entry_low=_round_price(entry_low, digits),
-        entry_high=_round_price(entry_high, digits),
-        entry_type=entry_type if status_active else "DIRECTIONAL SCENARIO / RISK GATE ACTIVE",
-        stop_loss=_round_price(stop, digits),
-        take_profit_1=_round_price(tp1, digits),
-        take_profit_2=_round_price(tp2, digits),
-        take_profit_3=_round_price(tp3, digits),
-        risk_reward_1=_rr(entry_mid, stop, tp1),
-        risk_reward_2=_rr(entry_mid, stop, tp2),
-        risk_reward_3=_rr(entry_mid, stop, tp3),
-        valid_until=valid_until,
-        invalidation=invalidation,
-        stop_basis=stop_basis,
-        target_basis=target_basis,
-        management_plan=management,
+    multipliers = {"tp1": 0.65, "tp2": 1.05, "tp3": 1.40}
+    if targets:
+        for key in multipliers:
+            value = _finite(targets.get(key), multipliers[key])
+            if value is not None:
+                multipliers[key] = float(value)
+    multipliers["tp1"] = max(0.60, min(0.90, multipliers["tp1"]))
+    multipliers["tp2"] = max(multipliers["tp1"] + 0.20, min(1.35, multipliers["tp2"]))
+    multipliers["tp3"] = max(multipliers["tp2"] + 0.20, min(1.80, multipliers["tp3"]))
+    tp1 = entry_mid + sign * stop_distance * multipliers["tp1"]
+    tp2 = entry_mid + sign * stop_distance * multipliers["tp2"]
+    tp3 = entry_mid + sign * stop_distance * multipliers["tp3"]
+    risk_plan = _risk_plan(side, entry_mid, stop, risk_inputs)
+    entry_live = entry_low <= price <= entry_high and risk_plan.status != "BLOCK"
+    near_tolerance = max(atr * 0.22, zone_half)
+    near_entry = entry_low - near_tolerance <= price <= entry_high + near_tolerance
+    status = "ENTER" if entry_live else "WAIT"
+    now = datetime.now(timezone.utc)
+    return AttrMap(
+        side=side,
+        status=status,
+        setup_type=setup_type,
+        entry_low=round(entry_low, digits),
+        entry_high=round(entry_high, digits),
+        entry_price=round(entry_mid, digits),
+        stop_loss=round(stop, digits),
+        take_profit_1=round(tp1, digits),
+        take_profit_2=round(tp2, digits),
+        take_profit_3=round(tp3, digits),
+        risk_reward_1=round(multipliers["tp1"], 2),
+        risk_reward_2=round(multipliers["tp2"], 2),
+        risk_reward_3=round(multipliers["tp3"], 2),
+        entry_live=entry_live,
+        near_entry=near_entry,
+        entry_tolerance=round(near_tolerance, digits),
         risk_plan=risk_plan,
-        rationale=reasons[:12],
-        warnings=common_warnings,
+        invalidation=(
+            "M15 structure / AVWAP / value support failed"
+            if side == "BUY"
+            else "M15 structure / AVWAP / value resistance failed"
+        ),
+        valid_until=(now + timedelta(minutes=90)).isoformat(),
+        atr=round(atr, digits),
+        pillar_votes=dict(pillars),
     )
+
+
+def derive_feature_votes(
+    indicators: list[Any],
+    liquidity: list[Any] | None = None,
+    macro: Any | None = None,
+    market_state: str | None = None,
+) -> dict[str, int]:
+    """Return only the three directional feature votes; legacy votes are neutral."""
+    price = 0.0
+    for tf in ("M15", "H1", "M5"):
+        item = _snapshot(indicators, tf)
+        price = float(_number(item, "last_price", "close", "price", default=0.0) or 0.0)
+        if price:
+            break
+    pillars, _ = _aggregate_pillars(indicators, price)
+    votes = {name: int(pillars[name]) for name in PILLARS}
+    votes.update({name: 0 for name in LEGACY_FEATURES})
+    return votes
 
 
 def build_technical_report(
     symbol: str,
     data_time: str,
     price: float,
-    indicators: list[IndicatorSnapshot],
-    liquidity: list[LiquiditySnapshot],
-    data_source: str,
+    indicators: list[Any],
+    liquidity: list[Any] | None = None,
+    data_source: str = "LIVE",
     digits: int = 2,
-    point: float = 0.01,
-    extra_notes: list[str] | None = None,
     adaptive_weights: dict[str, float] | None = None,
     target_multipliers: dict[str, float] | None = None,
-    adaptive_summary: AdaptiveLearningSummary | None = None,
-    risk_inputs: RiskInputs | None = None,
-    macro: MacroConfirmation | None = None,
+    adaptive_summary: Any | None = None,
+    risk_inputs: Any | None = None,
+    macro: Any | None = None,
     macro_required_for_entry: bool = False,
-    previous_state: str | None = None,
-    trap_anchor_price: float | None = None,
-    trap_age: int = 0,
-) -> TechnicalReport:
-    """Build a three-pillar XAU/USD decision.
-
-    Direction is produced exclusively by market structure, anchored VWAP and
-    volume profile. DXY and US10Y remain display-only context and never block a
-    technical entry. ATR is retained only for risk geometry and target sizing.
-    """
-    del macro_required_for_entry, previous_state, trap_anchor_price, trap_age
-    if not indicators:
-        raise ValueError("At least one indicator snapshot is required.")
-    if not math.isfinite(price) or price <= 0:
-        raise ValueError("The supplied market price is invalid.")
-
-    weights = {**DEFAULT_ADAPTIVE_WEIGHTS, **(adaptive_weights or {})}
-    targets = {"tp1": 0.65, "tp2": 1.05, "tp3": 1.40, **(target_multipliers or {})}
-    risk = risk_inputs or RiskInputs()
-
-    bullish, bearish, buy_reasons, sell_reasons = _weighted_market_scores(indicators, weights)
-    stats = _market_stats(indicators)
-    alignment = _timeframe_alignment(indicators)
-    liq = _liquidity_context(liquidity, price)
-    m15 = _select_snapshot(indicators, "M15")
-    h1 = _select_snapshot(indicators, "H1")
-    h4 = _select_snapshot(indicators, "H4")
-
-    h1_atr = max(float(h1.atr14 or m15.atr14 or h4.atr14 or price * 0.002), point * 10)
-    m15_atr = max(float(m15.atr14 or h1_atr * 0.45), point * 8)
-    atr_pct = float(h1.atr_pct or (h1_atr / price * 100.0))
-
-    net = bullish - bearish
-    buy_score = int(round(max(5.0, min(95.0, 50.0 + net * 0.58))))
-    sell_score = 100 - buy_score
-    bullish_tf = int(alignment["bullish"])
-    bearish_tf = int(alignment["bearish"])
-
-    m15_votes = _pillar_vote(m15)
-    h1_votes = _pillar_vote(h1)
-    h4_votes = _pillar_vote(h4)
-    m15_bull = sum(1 for vote in m15_votes if vote > 0)
-    m15_bear = sum(1 for vote in m15_votes if vote < 0)
-    h1_bull = sum(1 for vote in h1_votes if vote > 0)
-    h1_bear = sum(1 for vote in h1_votes if vote < 0)
-    h4_bull = sum(1 for vote in h4_votes if vote > 0)
-    h4_bear = sum(1 for vote in h4_votes if vote < 0)
-
-    breakout_up = bool(stats["breakout_up"] and m15_bull >= 2 and h1_bear <= 1)
-    breakout_down = bool(stats["breakout_down"] and m15_bear >= 2 and h1_bull <= 1)
-
-    buy_confirmed = bool(
-        breakout_up
-        or (
-            buy_score >= 60
-            and bullish_tf >= 2
-            and m15_bull >= 2
-            and h1_bull >= 2
-            and h4_bear <= 1
+    **_: Any,
+) -> Any:
+    """Build a report whose direction is decided exclusively by the three pillars."""
+    last_price = float(price)
+    pillars, per_tf = _aggregate_pillars(indicators, last_price)
+    state, buy_weight, sell_weight = _direction(pillars, adaptive_weights)
+    active_setup = None
+    reasons: list[str] = []
+    for pillar in PILLARS:
+        vote = pillars[pillar]
+        reasons.append(f"{pillar.replace('_', ' ').title()}: {'BUY' if vote > 0 else 'SELL' if vote < 0 else 'NEUTRAL'}")
+    aligned = sum(vote != 0 and ((state == "BUY" and vote > 0) or (state == "SELL" and vote < 0)) for vote in pillars.values())
+    tf_aligned = 0
+    if state in {"BUY", "SELL"}:
+        sign = 1 if state == "BUY" else -1
+        tf_aligned = sum(per_tf[tf][pillar] == sign for tf in per_tf for pillar in PILLARS)
+        active_setup = _entry_geometry(
+            state,
+            last_price,
+            indicators,
+            pillars,
+            per_tf,
+            risk_inputs,
+            target_multipliers,
+            digits,
         )
-        or (buy_score >= 68 and bullish_tf >= 3 and h1_bear <= 1)
+    confidence = 35 if state == "STUCK" else min(92, 52 + aligned * 10 + tf_aligned * 3)
+    if active_setup is not None and active_setup.risk_plan.status == "BLOCK":
+        confidence = min(confidence, 68)
+    buy_score = round(buy_weight / 3.0 * 100)
+    sell_score = round(sell_weight / 3.0 * 100)
+    trap_reason = "Three pillars are not sufficiently aligned." if state == "STUCK" else ""
+    execution_label = (
+        "NO TRADE · THREE PILLARS NOT ALIGNED"
+        if state == "STUCK"
+        else f"ENTER {state} · ENTRY LIVE NOW"
+        if active_setup and active_setup.status == "ENTER"
+        else f"{state} TREND · WAIT FOR ENTRY"
     )
-    sell_confirmed = bool(
-        breakout_down
-        or (
-            sell_score >= 60
-            and bearish_tf >= 2
-            and m15_bear >= 2
-            and h1_bear >= 2
-            and h4_bull <= 1
-        )
-        or (sell_score >= 68 and bearish_tf >= 3 and h1_bull <= 1)
-    )
-
-    # When both sides appear confirmed, prefer the side with the larger score;
-    # otherwise classify as balanced rather than inventing a trap state.
-    if buy_confirmed and sell_confirmed:
-        if buy_score >= sell_score + 10:
-            sell_confirmed = False
-        elif sell_score >= buy_score + 10:
-            buy_confirmed = False
-        else:
-            buy_confirmed = sell_confirmed = False
-
-    if atr_pct >= 0.85:
-        volatility_state = "extreme"
-    elif atr_pct >= 0.48:
-        volatility_state = "high"
-    elif atr_pct <= 0.16:
-        volatility_state = "low"
-    else:
-        volatility_state = "normal"
-
-    trap_reason = ""
-    if buy_confirmed:
-        market_state = "BUY"
-        regime = "breakout_up" if breakout_up else (
-            "volatile_bullish" if volatility_state in {"high", "extreme"} else "bullish_trend"
-        )
-        signal_label = "ENTER BUY · THREE-PILLAR BREAKOUT" if breakout_up else "ENTER BUY · THREE-PILLAR TREND"
-    elif sell_confirmed:
-        market_state = "SELL"
-        regime = "breakout_down" if breakout_down else (
-            "volatile_bearish" if volatility_state in {"high", "extreme"} else "bearish_trend"
-        )
-        signal_label = "ENTER SELL · THREE-PILLAR BREAKOUT" if breakout_down else "ENTER SELL · THREE-PILLAR TREND"
-    else:
-        market_state = "STUCK"
-        regime = "stuck_range"
-        signal_label = "NO TRADE · THREE PILLARS NOT ALIGNED"
-        trap_reason = (
-            "Market structure, anchored VWAP and volume profile do not yet agree on one direction. "
-            "DXY and US10Y are informational only and did not block a signal."
-        )
-
-    edge = max(buy_score, sell_score) - 50
-    aligned_tf = bullish_tf if market_state == "BUY" else bearish_tf if market_state == "SELL" else max(bullish_tf, bearish_tf)
-    confidence = int(round(max(52, min(88, 54 + edge * 0.48 + aligned_tf * 3.5))))
-    trend_strength = int(round(max(0, min(100, abs(net) * 1.15 + aligned_tf * 12))))
-
-    active_buy = market_state == "BUY"
-    active_sell = market_state == "SELL"
-    buy_setup = _build_setup(
-        "BUY", price, h1_atr, m15_atr, buy_score, liq["supports"], liq["resistances"], digits,
-        active_buy, buy_reasons, data_source, m15, h1, str(regime), risk, targets,
-    )
-    sell_setup = _build_setup(
-        "SELL", price, h1_atr, m15_atr, sell_score, liq["supports"], liq["resistances"], digits,
-        active_sell, sell_reasons, data_source, m15, h1, str(regime), risk, targets,
-    )
-    active_setup = buy_setup if active_buy else sell_setup if active_sell else None
-
-    if active_setup is not None and active_setup.risk_plan is not None:
-        if active_setup.risk_plan.status == "REDUCE_LOT":
-            signal_label += " · REDUCE LOT"
-        elif active_setup.risk_plan.status == "NO_TRADE":
-            signal_label = f"{market_state} BIAS · RISK TOO HIGH"
-
-    if active_setup is not None and active_setup.status == "ENTER":
-        entry_tolerance = max(0.20 * m15_atr, 0.35)
-        entry_live = active_setup.entry_low - entry_tolerance <= price <= active_setup.entry_high + entry_tolerance
-        if entry_live:
-            signal_label += " · ENTRY LIVE NOW"
-        else:
-            signal_label += " · WAIT FOR ENTRY ZONE"
-            active_setup.warnings.append(
-                "Direction is active, but Telegram remains silent until live price reaches the entry zone."
-            )
-
-    notes = [
-        "Directional decisions use only market structure, anchored VWAP and volume profile.",
-        "DXY and US10Y are display-only context; they cannot block or reverse a signal.",
-        "ATR is used only to place realistic stops, targets and entry tolerances; it does not vote on direction.",
-        "The FVG specialist strategy and EMA/MACD/RSI/ADX decision layers are disabled in this build.",
-    ]
-    notes.extend(extra_notes or [])
-
-    return TechnicalReport(
-        symbol=symbol,
-        data_time=data_time,
-        last_price=_round_price(price, digits),
-        data_source=data_source,  # type: ignore[arg-type]
-        regime=regime,  # type: ignore[arg-type]
-        market_state=market_state,  # type: ignore[arg-type]
-        recommendation=market_state,  # type: ignore[arg-type]
-        signal_label=signal_label,
-        confidence=confidence,
-        buy_score=buy_score,
-        sell_score=sell_score,
-        trend_strength=trend_strength,
-        volatility_state=volatility_state,  # type: ignore[arg-type]
-        trap_reason=trap_reason,
-        indicators=indicators,
-        liquidity=liquidity,
-        active_setup=active_setup,
-        buy_setup=buy_setup,
-        sell_setup=sell_setup,
-        macro=macro,
-        adaptive=adaptive_summary,
-        special_signals=[],
-        data_quality_notes=notes,
-    )
+    values = {
+        "symbol": symbol,
+        "data_time": data_time,
+        "last_price": round(last_price, digits),
+        "market_state": state,
+        "confidence": int(confidence),
+        "buy_score": int(buy_score),
+        "sell_score": int(sell_score),
+        "regime": f"{state}_THREE_PILLAR" if state != "STUCK" else "THREE_PILLAR_MIXED",
+        "volatility_state": "normal",
+        "trap_reason": trap_reason,
+        "active_setup": active_setup,
+        "data_source": data_source,
+        "reasons": reasons,
+        "indicator_snapshots": indicators,
+        "indicators": indicators,
+        "liquidity_snapshots": liquidity or [],
+        "liquidity": liquidity or [],
+        "macro": macro,
+        "special_signals": [],
+        "pillar_votes": pillars,
+        "pillar_timeframe_votes": per_tf,
+        "execution_label": execution_label,
+        "entry_live": bool(active_setup and active_setup.entry_live),
+        "near_entry": bool(active_setup and active_setup.near_entry),
+        "adaptive_summary": adaptive_summary,
+        "macro_required_for_entry": False,
+    }
+    return _construct_report(values)
