@@ -2,7 +2,9 @@ name: AurumEdge M15 Signal Watch
 
 on:
   schedule:
-    # Runs about one minute after every 15-minute candle close (UTC).
+    # Runs about one minute after every completed 15-minute candle (UTC).
+    # This GitHub runner is independent of the Streamlit app, so app hibernation
+    # does not stop the SMA18/EMA calculation or Telegram delivery.
     - cron: "1,16,31,46 * * * *"
   workflow_dispatch:
     inputs:
@@ -23,6 +25,7 @@ jobs:
   signal-watch:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -46,6 +49,8 @@ jobs:
             pip install pandas python-dotenv requests
           fi
 
+      # Signal processing is deliberately performed before any optional UI ping.
+      # The Streamlit website can be asleep and this step still runs normally.
       - name: Run M15 SMA18/EMA watcher
         env:
           TWELVE_DATA_API_KEY: ${{ secrets.TWELVE_DATA_API_KEY }}
@@ -68,14 +73,57 @@ jobs:
             echo "No signal-state change to persist."
             exit 0
           fi
+
           rm -f data/.sma18_state_changed
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add data/sma18_ema_state.json
+
           if git diff --cached --quiet; then
             echo "State file is unchanged."
             exit 0
           fi
+
           git commit -m "Update SMA18 M15 alert state [skip ci]"
           git pull --rebase origin "${GITHUB_REF_NAME}"
           git push origin "HEAD:${GITHUB_REF_NAME}"
+
+      # Optional best-effort UI keep-awake. Add a GitHub Actions secret named
+      # STREAMLIT_APP_URL containing the full https://...streamlit.app URL.
+      # Failure here never fails or delays the signal watcher.
+      - name: Best-effort Streamlit keep-awake
+        continue-on-error: true
+        env:
+          STREAMLIT_APP_URL: ${{ secrets.STREAMLIT_APP_URL }}
+        run: |
+          if [ -z "$STREAMLIT_APP_URL" ]; then
+            echo "STREAMLIT_APP_URL is not configured; signal watching remains active."
+            exit 0
+          fi
+
+          APP_URL="${STREAMLIT_APP_URL%/}"
+          curl --location --silent --show-error \
+            --connect-timeout 8 --max-time 20 \
+            --user-agent "AurumEdge-GitHub-Watcher/1.0" \
+            "${APP_URL}/?aurumedge_keepalive=$(date +%s)" \
+            --output /dev/null || true
+
+      # A watcher/API/configuration failure is reported through Telegram so it
+      # cannot remain unnoticed while the Streamlit UI is sleeping.
+      - name: Notify Telegram if watcher failed
+        if: ${{ failure() }}
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          if [ -z "$TELEGRAM_BOT_TOKEN" ] || [ -z "$TELEGRAM_CHAT_ID" ]; then
+            echo "Telegram credentials unavailable; cannot send failure notification."
+            exit 0
+          fi
+
+          MESSAGE=$'🔴 AURUMEDGE WATCHER FAILURE\n\nThe M15 SMA18/EMA GitHub watcher failed. Open the repository Actions tab and inspect the latest AurumEdge M15 Signal Watch run.'
+          curl --fail --silent --show-error --max-time 20 \
+            -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text=${MESSAGE}" \
+            --data-urlencode "disable_web_page_preview=true"
