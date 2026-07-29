@@ -35,6 +35,7 @@ from gold_web_terminal.models import (
 )
 from gold_web_terminal.risk_engine import RiskInputs
 from gold_web_terminal.strategy import build_technical_report
+from gold_web_terminal.sma18_ema_strategy import evaluate_sma18_strategy, snapshot_to_dict
 
 APP_DIR = Path(__file__).resolve().parent
 load_dotenv(APP_DIR / ".env")
@@ -48,7 +49,7 @@ try:
 except Exception:
     pass
 
-BUILD_VERSION = "5.8.3-mobile-restored-ui-lifecycle"
+BUILD_VERSION = "5.9.0-sma18-m15-telegram"
 TIMEFRAMES = ["M5", "M15", "H1", "H4", "D1"]
 TV_INTERVALS = {"M5": "5", "M15": "15", "H1": "60", "H4": "240", "D1": "D"}
 
@@ -290,6 +291,40 @@ def signal_card(report: TechnicalReport, final_state: str, final_note: str) -> s
 <div class="level-box"><span>TP3 · {setup.risk_reward_3:.2f}R</span><strong class="state-buy">{fmt(setup.take_profit_3)}</strong></div>
 </div><div class="risk-banner {risk_tone}">{escape(risk_text)}<br>{escape(setup.invalidation)}</div>'''
     return f'''<div class="signal-shell"><div class="signal-overline">Current execution state</div><div class="signal-title state-{css_state}">{escape(title)}</div><div class="signal-copy">{escape(copy)}</div>{plan}</div>'''
+
+
+def sma18_signal_card(snapshot) -> str:
+    signal = snapshot.current_signal
+    if signal is None:
+        latest = snapshot.latest_signal
+        latest_note = (
+            f"Last signal: {latest.side} · {latest.setup} · {latest.confirmed_time.replace('+00:00', ' UTC')}"
+            if latest is not None else "No qualifying M15 signal is available in the loaded history."
+        )
+        return (
+            '<div class="signal-shell">'
+            '<div class="signal-overline">SMA18 + EMA · confirmed M15 candles</div>'
+            '<div class="signal-title state-stuck">WAIT</div>'
+            '<div class="signal-copy">No new BUY or SELL signal on the latest completed 15-minute candle.</div>'
+            f'<div class="mobile-callout">{escape(latest_note)}</div>'
+            '</div>'
+        )
+    tone = "state-buy" if signal.side == "BUY" else "state-sell"
+    return (
+        '<div class="signal-shell">'
+        '<div class="signal-overline">SMA18 + EMA · confirmed M15 candle</div>'
+        f'<div class="signal-title {tone}">{escape(signal.side)} · TRADE READY</div>'
+        f'<div class="signal-copy">{escape(signal.setup)} · Daily SMA18 bias {escape(signal.daily_bias)} · confirmed {escape(signal.confirmed_time.replace("+00:00", " UTC"))}</div>'
+        '<div class="levels-grid">'
+        f'<div class="level-box wide"><span>Entry</span><strong>{fmt(signal.entry)}</strong></div>'
+        f'<div class="level-box"><span>Stop loss</span><strong class="state-sell">{fmt(signal.stop_loss)}</strong></div>'
+        f'<div class="level-box"><span>0.8R win level</span><strong class="state-buy">{fmt(signal.win_level)}</strong></div>'
+        f'<div class="level-box"><span>Take profit · 2R</span><strong class="state-buy">{fmt(signal.take_profit)}</strong></div>'
+        f'<div class="level-box"><span>Initial risk</span><strong>{fmt(signal.risk)}</strong></div>'
+        '</div>'
+        '<div class="mobile-callout">Telegram is sent once after the M15 candle is confirmed. Duplicate delivery is blocked by signal ID.</div>'
+        '</div>'
+    )
 
 
 def special_strategy_card(signal, current_price: float | None = None) -> str:
@@ -558,106 +593,52 @@ report = build_technical_report(
     trap_age=int(decision_memory.get("trap_age", 0)),
 )
 
-signal_time = frames["M15"].iloc[-1]["time"]
-feature_votes = derive_feature_votes(indicator_snapshots, liquidity_snapshots, macro, report.market_state)
-report = adaptive.apply_capital_preservation(report, signal_time, feature_votes)
-
-four_hour_fvg = None
-report.special_signals = []
-
-primary_entry_live = is_primary_entry_live(report)
-primary_entry_near = is_primary_entry_near(report)
-pending_exit_near = adaptive.pending_near_exit(float(report.last_price))
-smart_refresh_seconds = (
-    30 if primary_entry_live or pending_exit_near
-    else 45 if primary_entry_near
-    else 120 if report.market_state in {"BUY", "SELL"}
-    else auto_refresh_seconds
-)
-st.session_state["smart_refresh_seconds"] = min(auto_refresh_seconds, smart_refresh_seconds)
-fvg_entry_live = False
-
+# The existing data, chart, macro and risk infrastructure stays unchanged.
+# Only the primary decision engine is replaced by the confirmed M15 SMA18/EMA engine.
+sma18_snapshot = evaluate_sma18_strategy(bundle.frames, symbol=bundle.symbol)
+current_sma18_signal = sma18_snapshot.current_signal
+latest_sma18_signal = sma18_snapshot.latest_signal
+primary_entry_live = current_sma18_signal is not None
+primary_entry_near = False
+pending_exit_near = False
+st.session_state["smart_refresh_seconds"] = min(auto_refresh_seconds, 60 if primary_entry_live else auto_refresh_seconds)
 mobile_alert_messages: list[str] = []
-if bool(getattr(settings, "local_alerts_enabled", False)):
-    alert_cfg = AlertConfig.from_env()
-    state_path = Path(getattr(settings, "alert_state_path", "data/alert_state.json"))
-    if not state_path.is_absolute():
-        state_path = APP_DIR / state_path
-    alert_state = AlertState(state_path)
-    local_events = build_alert_events(report, None, review_outcomes=adaptive.pending_close_reviews())
-    sent_ids, alert_errors = dispatch_events(local_events, alert_cfg, alert_state)
-    record_non_alert_states(report, None, alert_cfg, alert_state)
-    closed_signal_ids = [
-        event.signal_id
-        for event in local_events
-        if event.category.startswith("TRADE_CLOSE_")
-        and (event.event_id in sent_ids or alert_state.was_sent(event.event_id))
-    ]
-    adaptive.mark_close_alerted(closed_signal_ids)
-    if sent_ids:
-        mobile_alert_messages.append(f"Sent {len(sent_ids)} new alert(s).")
-    mobile_alert_messages.extend(alert_errors)
 
-if report.market_state == "TRAP":
-    if decision_memory.get("state") != "TRAP" or decision_memory.get("trap_anchor_price") is None:
-        decision_memory["trap_anchor_price"] = report.last_price
-        decision_memory["trap_age"] = 1
-    else:
-        decision_memory["trap_age"] = int(decision_memory.get("trap_age", 0)) + 1
-else:
-    decision_memory["trap_anchor_price"] = None
-    decision_memory["trap_age"] = 0
-decision_memory["state"] = report.market_state
-
-if primary_entry_live:
-    adaptive.register_signal(report, signal_time, feature_votes, timeframe="M15")
-
-# Optional research is informational only and never changes the three-pillar decision.
-final_state = report.market_state
-final_note = "Market structure + Anchored VWAP + Volume Profile"
-
-score_edge = int(report.buy_score) - int(report.sell_score)
-directional_bias = "BUY" if score_edge >= 15 else "SELL" if score_edge <= -15 else "NEUTRAL"
-if primary_entry_live:
-    decision_display = f"{report.market_state} ENTRY NOW"
-    decision_tone_state = report.market_state
-    execution_note = "Regular entry price is live; Telegram is eligible now."
-elif directional_bias in {"BUY", "SELL"}:
-    decision_display = f"{directional_bias} BIAS · WAIT"
-    decision_tone_state = directional_bias
-    execution_note = f"Execution gate: {final_state}. No alert until the live price reaches a qualified entry zone."
-else:
-    decision_display = final_state
-    decision_tone_state = final_state
-    execution_note = "No qualified directional edge or live entry zone."
+final_state = current_sma18_signal.side if current_sma18_signal is not None else "STUCK"
+final_note = "Confirmed M15 SMA18 + EMA setup" if current_sma18_signal is not None else "Waiting for the next confirmed M15 setup"
+directional_bias = current_sma18_signal.side if current_sma18_signal is not None else sma18_snapshot.daily_bias
+decision_display = f"{current_sma18_signal.side} TRADE READY" if current_sma18_signal is not None else "WAIT"
+decision_tone_state = current_sma18_signal.side if current_sma18_signal is not None else "STUCK"
+execution_note = (
+    "A confirmed M15 signal is ready and the background watcher sends it to Telegram once."
+    if current_sma18_signal is not None
+    else "No qualified BUY or SELL signal on the latest completed 15-minute candle."
+)
 
 chart_liquidity = next((item for item in liquidity_snapshots if item.timeframe == chart_tf), None)
 if chart_liquidity is None:
     chart_liquidity = next((item for item in liquidity_snapshots if item.timeframe == "H1"), None)
 
-if completed_reviews:
-    st.success(f"Adaptive brain reviewed {len(completed_reviews)} completed signal(s).")
-
 state_css = state_class(decision_tone_state)
 st.markdown(
     f'''<div class="mobile-kpis">
-<div class="mkpi"><span>Indicative price</span><strong>{fmt(report.last_price)}</strong><small>{escape(report.symbol)}</small></div>
+<div class="mkpi"><span>Indicative price</span><strong>{fmt(sma18_snapshot.latest_price)}</strong><small>{escape(sma18_snapshot.symbol)}</small></div>
 <div class="mkpi"><span>Decision</span><strong class="state-{state_css}">{escape(decision_display)}</strong><small>{escape(final_note)}</small></div>
-<div class="mkpi"><span>Confidence</span><strong>{report.confidence}%</strong><small>Three-pillar quality</small></div>
-<div class="mkpi"><span>Buy / Sell score</span><strong>{report.buy_score} / {report.sell_score}</strong><small>{report.volatility_state.upper()} volatility</small></div>
+<div class="mkpi"><span>Completed trades</span><strong>{sma18_snapshot.stats.total}</strong><small>{sma18_snapshot.stats.open} still open</small></div>
+<div class="mkpi"><span>Win ratio · 0.8R</span><strong>{sma18_snapshot.stats.win_rate:.1f}%</strong><small>{sma18_snapshot.stats.wins} wins · {sma18_snapshot.stats.losses} losses</small></div>
 </div>''',
     unsafe_allow_html=True,
 )
 st.markdown(
-    f'<div class="mobile-callout"><strong>Directional bias:</strong> {escape(directional_bias)} · '
-    f'<strong>Execution:</strong> {escape("ENTRY LIVE NOW" if primary_entry_live else "WAIT")}<br>'
+    f'<div class="mobile-callout"><strong>Daily SMA18 bias:</strong> {escape(directional_bias)} · '
+    f'<strong>Execution:</strong> {escape("TRADE READY" if primary_entry_live else "WAIT")}<br>'
     f'{escape(execution_note)}</div>',
     unsafe_allow_html=True,
 )
 
 st.markdown('<div class="mobile-section">DXY and yield direction · display only</div>', unsafe_allow_html=True)
 st.markdown(macro_cards(macro), unsafe_allow_html=True)
-st.markdown(signal_card(report, final_state, final_note), unsafe_allow_html=True)
+st.markdown(sma18_signal_card(sma18_snapshot), unsafe_allow_html=True)
 for _msg in mobile_alert_messages:
     st.caption(_msg)
 
@@ -665,43 +646,27 @@ tabs = st.tabs(["SIGNAL", "CONTEXT", "ALERTS", "CHART", "LEVELS", "BRAIN", "MORE
 signal_tab, macro_tab, alerts_tab, chart_tab, levels_tab, brain_tab, more_tab = tabs
 
 with signal_tab:
-    st.markdown('<div class="mobile-section">Multi-timeframe decision stack</div>', unsafe_allow_html=True)
-    st.markdown('<div class="mobile-callout">Every timeframe votes using only market structure, anchored VWAP and volume profile. M15/H1 time the entry; H4/D1 provide direction.</div>', unsafe_allow_html=True)
-    st.markdown(timeframe_cards(indicator_snapshots), unsafe_allow_html=True)
-    st.markdown('<div class="mobile-section">Why this decision</div>', unsafe_allow_html=True)
-    reasons: list[str] = []
-    if report.active_setup and final_state in {"BUY", "SELL"}:
-        reasons.extend(report.active_setup.rationale)
-    elif report.trap_reason:
-        reasons.append(report.trap_reason)
-    else:
-        reasons.append("Market structure, anchored VWAP and volume profile produced the current state.")
-    for reason in reasons[:9]:
-        st.markdown(f'<div class="mobile-callout">• {escape(str(reason))}</div>', unsafe_allow_html=True)
-
-    setup = report.active_setup
-    if setup and final_state in {"BUY", "SELL"}:
-        rp = setup.risk_plan
-        risk_line = (
-            f"Risk: {rp.status}; recommended lot {rp.recommended_lot:.2f}"
-            if rp else "Risk: UNAVAILABLE"
-        )
+    st.markdown('<div class="mobile-section">M15 SMA18 + EMA decision</div>', unsafe_allow_html=True)
+    st.markdown('<div class="mobile-callout">The primary trade decision now uses completed 15-minute candles. Daily SMA18 and completed 4H support/resistance provide context; EMA9/21, DMI/ADX, breakout and pullback rules time the entry.</div>', unsafe_allow_html=True)
+    st.markdown(sma18_signal_card(sma18_snapshot), unsafe_allow_html=True)
+    signal = current_sma18_signal or latest_sma18_signal
+    if signal is not None:
         summary = (
-            f"XAU/USD {chart_tf} — {final_state}\n"
-            f"Entry: {setup.entry_low:,.2f}–{setup.entry_high:,.2f}\n"
-            f"SL: {setup.stop_loss:,.2f}\n"
-            f"TP1: {setup.take_profit_1:,.2f}\n"
-            f"TP2: {setup.take_profit_2:,.2f}\n"
-            f"TP3: {setup.take_profit_3:,.2f}\n"
-            f"Confidence: {report.confidence}%\n"
-            f"DXY: {macro.dxy.direction} · US10Y: {macro.us10y.direction} (context only)\n"
-            f"{risk_line}\n"
-            f"Invalidation: {setup.invalidation}"
+            f"{sma18_snapshot.symbol} M15 — {signal.side}\n"
+            f"Setup: {signal.setup}\n"
+            f"Entry: {signal.entry:,.2f}\n"
+            f"SL: {signal.stop_loss:,.2f}\n"
+            f"0.8R win level: {signal.win_level:,.2f}\n"
+            f"TP 2R: {signal.take_profit:,.2f}\n"
+            f"4H support: {fmt(signal.support_4h)}\n"
+            f"4H resistance: {fmt(signal.resistance_4h)}\n"
+            f"Confirmed: {signal.confirmed_time.replace('+00:00', ' UTC')}"
         )
     else:
         summary = (
-            f"XAU/USD {chart_tf} — {final_state}\nPrice: {report.last_price:,.2f}\n"
-            f"Confidence: {report.confidence}%\nDXY: {macro.dxy.direction} · US10Y: {macro.us10y.direction} (context only)\nNo immediate entry."
+            f"{sma18_snapshot.symbol} M15 — WAIT\n"
+            f"Price: {sma18_snapshot.latest_price:,.2f}\n"
+            "No qualifying signal on the latest completed M15 candle."
         )
     st.markdown("**Shareable summary**")
     st.code(summary, language=None)
@@ -724,34 +689,26 @@ with macro_tab:
         })
 
 with alerts_tab:
-    st.markdown('<div class="mobile-section">Signal notifications</div>', unsafe_allow_html=True)
-    cfg = AlertConfig.from_env()
-    telegram_status = "READY" if cfg.telegram_enabled else "NOT SET"
-    email_status = "READY" if cfg.email_enabled else "NOT SET"
-    forming_status = "ENTRY ONLY"
+    st.markdown('<div class="mobile-section">M15 Telegram notifications</div>', unsafe_allow_html=True)
+    telegram_ready = bool(os.getenv("TELEGRAM_BOT_TOKEN", "").strip() and os.getenv("TELEGRAM_CHAT_ID", "").strip())
+    telegram_status = "READY" if telegram_ready else "NOT SET"
     st.markdown(
         '<div class="brain-grid">'
-        f'<div class="brain-card"><span>Telegram push</span><strong>{telegram_status}</strong><small>Best option for instant iPhone notification</small></div>'
-        f'<div class="brain-card"><span>Email alerts</span><strong>{email_status}</strong><small>SMTP delivery</small></div>'
-        f'<div class="brain-card"><span>Minimum confidence</span><strong>{cfg.minimum_confidence}%</strong><small>Lower-quality signals are not sent</small></div>'
-        f'<div class="brain-card"><span>Alert mode</span><strong>{forming_status}</strong><small>Live entry plus TP1 / SL / timeout close alerts</small></div>'
+        f'<div class="brain-card"><span>Telegram push</span><strong>{telegram_status}</strong><small>Uses TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID</small></div>'
+        '<div class="brain-card"><span>Signal timeframe</span><strong>M15</strong><small>Completed candle only</small></div>'
+        '<div class="brain-card"><span>Duplicate protection</span><strong>ACTIVE</strong><small>One message per signal ID</small></div>'
+        '<div class="brain-card"><span>Win definition</span><strong>0.8R</strong><small>Counter only; entry alert is immediate after confirmation</small></div>'
         '</div>',
         unsafe_allow_html=True,
     )
-    if st.button("SEND TEST NOTIFICATION", key="mobile_test_notification", use_container_width=True):
-        delivered, errors = send_test_alert(cfg)
-        if delivered:
-            st.success("Test notification sent.")
-        else:
-            st.error("No channel configured or delivery failed: " + "; ".join(errors))
-    st.markdown('<div class="mobile-callout">GitHub Actions monitors while the app is closed. Near an entry, TP1 or SL it performs faster burst checks. Telegram is sent when a qualified entry becomes live and again when TP1, SL or the outcome timeout closes the tracked trade. Bias and STUCK states do not create trade alerts.</div>', unsafe_allow_html=True)
+    st.markdown('<div class="mobile-callout">The GitHub watcher checks shortly after each 15-minute candle close and sends a BUY or SELL message directly to Telegram. TradingView alerts are not used.</div>', unsafe_allow_html=True)
 
 with chart_tab:
     st.markdown('<div class="mobile-section">Professional market map</div>', unsafe_allow_html=True)
     st.markdown(
         mobile_market_map_html(
-            frames[chart_tf], report.symbol, chart_tf, chart_liquidity,
-            report.active_setup if final_state in {"BUY", "SELL"} else None,
+            frames[chart_tf], sma18_snapshot.symbol, chart_tf, chart_liquidity,
+            None,
         ),
         unsafe_allow_html=True,
     )
@@ -787,39 +744,18 @@ with levels_tab:
             st.dataframe(pd.DataFrame(item.resistance_zones), hide_index=True, width="stretch")
 
 with brain_tab:
-    summary = adaptive.summary()
+    stats = sma18_snapshot.stats
     st.markdown(f'''<div class="brain-grid">
-<div class="brain-card"><span>Reviewed signals</span><strong>{summary.reviewed_signals}</strong><small>Completed evidence only</small></div>
-<div class="brain-card"><span>Win rate</span><strong>{summary.win_rate:.1f}%</strong><small>{summary.wins} wins · {summary.losses} losses · {summary.timeouts} timeouts</small></div>
-<div class="brain-card"><span>Adaptive targets</span><strong>{summary.target_r_multipliers['tp1']:.2f}R / {summary.target_r_multipliers['tp2']:.2f}R / {summary.target_r_multipliers['tp3']:.2f}R</strong><small>Capital-preservation defaults, then clean pre-exit movement</small></div>
-<div class="brain-card"><span>Learning mode</span><strong>{'ACTIVE' if summary.enabled else 'OFF'}</strong><small>Confidence cap {adaptive.confidence_cap()}% · full learning near {settings.adaptive_min_samples} samples</small></div>
+<div class="brain-card"><span>Total trades</span><strong>{stats.total}</strong><small>Resolved signals in loaded M15 history</small></div>
+<div class="brain-card"><span>Winning trades</span><strong class="state-buy">{stats.wins}</strong><small>Price reached the 0.8R favourable level first</small></div>
+<div class="brain-card"><span>Losing trades</span><strong class="state-sell">{stats.losses}</strong><small>Stop loss was reached first</small></div>
+<div class="brain-card"><span>Winning ratio</span><strong>{stats.win_rate:.1f}%</strong><small>{stats.open} open signal(s) excluded</small></div>
 </div>''', unsafe_allow_html=True)
-    st.markdown(f'<div class="mobile-callout"><strong>Latest review</strong><br>{escape(summary.last_review)}</div>', unsafe_allow_html=True)
-    active_features = {"market_structure", "anchored_vwap", "volume_profile", "entry_quality"}
-    weight_rows = [{"Feature": k.replace("_", " ").title(), "Weight": round(v, 3), "Samples": summary.indicator_samples.get(k, 0)} for k, v in summary.indicator_weights.items() if k in active_features]
-    st.dataframe(pd.DataFrame(weight_rows), hide_index=True, width="stretch")
-    st.caption("Streamlit Cloud storage can reset after redeployment. Download an adaptive-state backup periodically.")
-    try:
-        state_bytes = adaptive_path.read_bytes() if adaptive_path.exists() else json.dumps(adaptive.state, indent=2).encode("utf-8")
-        st.download_button("DOWNLOAD BRAIN BACKUP", data=state_bytes, file_name="adaptive_state.json", mime="application/json", use_container_width=True)
-    except Exception as exc:
-        st.warning(f"Could not prepare adaptive backup: {exc}")
-    restore = st.file_uploader("Restore adaptive-state JSON", type=["json"])
-    if restore is not None and st.button("RESTORE BRAIN STATE", use_container_width=True):
-        try:
-            parsed = json.loads(restore.getvalue().decode("utf-8"))
-            if not isinstance(parsed, dict) or "features" not in parsed:
-                raise ValueError("Not a valid AurumEdge adaptive state")
-            adaptive_path.parent.mkdir(parents=True, exist_ok=True)
-            adaptive_path.write_text(json.dumps(parsed, indent=2), encoding="utf-8")
-            st.success("Adaptive state restored. Refreshing…")
-            st.rerun()
-        except Exception as exc:
-            st.error(f"Restore failed: {exc}")
+    st.markdown('<div class="mobile-callout">Counter rule: BUY entry 4013 with SL 4003 has 10 points risk, so 0.8R is 4021. Reaching 4021 before the stop is counted as a win even when the full 2R target is not reached.</div>', unsafe_allow_html=True)
 
 with more_tab:
     st.markdown('<div class="mobile-section">Optional paid AI research</div>', unsafe_allow_html=True)
-    st.markdown('<div class="mobile-callout">OpenAI research is informational only. It cannot override the market-structure, anchored-VWAP and volume-profile signal.</div>', unsafe_allow_html=True)
+    st.markdown('<div class="mobile-callout">OpenAI research is informational only. It cannot override the confirmed M15 SMA18/EMA signal.</div>', unsafe_allow_html=True)
     can_ai = settings.openai_api_key.startswith("sk-") and bundle.source != "DEMO"
     if st.button("RUN PAID AI RESEARCH", disabled=not can_ai, use_container_width=True):
         try:
@@ -839,34 +775,34 @@ with more_tab:
     with st.expander("Open TradingView chart"):
         tradingview_widget(settings.tradingview_symbol, chart_tf)
     with st.expander("Diagnostics"):
-        setup = report.active_setup
-        rp = setup.risk_plan if setup else None
         st.json({
             "data_source": report.data_source,
-            "data_time": report.data_time,
-            "symbol": report.symbol,
+            "data_time": sma18_snapshot.latest_candle_time,
+            "symbol": sma18_snapshot.symbol,
             "build": BUILD_VERSION,
             "auto_refresh_enabled": auto_enabled,
             "auto_refresh_seconds": auto_refresh_seconds,
             "smart_refresh_seconds": st.session_state.get("smart_refresh_seconds", auto_refresh_seconds),
-            "entry_near": primary_entry_near,
+            "entry_near": False,
             "entry_live": primary_entry_live,
-            "pending_exit_near": pending_exit_near,
-            "all_timeframes_compared": TIMEFRAMES,
+            "pending_exit_near": False,
+            "signal_timeframe": "M15",
+            "support_resistance_timeframe": "H4",
             "last_refresh_reason": st.session_state.get("last_refresh_reason", "Initial synchronization"),
-            "decision_engine": "MARKET_STRUCTURE + ANCHORED_VWAP + VOLUME_PROFILE",
+            "decision_engine": "SMA18 + EMA9/21 + DMI/ADX + BREAKOUT/PULLBACK",
             "dxy_direction": macro.dxy.direction,
             "us10y_direction": macro.us10y.direction,
             "macro_signal_gate": False,
             "dxy_source": macro.dxy.source,
             "us10y_source": macro.us10y.source,
             "gold_4h_move": macro.gold_change_4h,
-            "adaptive_reviewed_signals": adaptive.summary().reviewed_signals,
-            "fvg_signals": "DISABLED",
-            "risk_status": rp.status if rp else "NO_SETUP",
-            "recommended_lot": rp.recommended_lot if rp else None,
+            "total_trades": sma18_snapshot.stats.total,
+            "winning_trades": sma18_snapshot.stats.wins,
+            "losing_trades": sma18_snapshot.stats.losses,
+            "win_rate": sma18_snapshot.stats.win_rate,
+            "latest_signal": snapshot_to_dict(sma18_snapshot)["latest_signal"],
             "broker_connected": False,
             "order_execution": False,
         })
 
-st.markdown(f'<div class="mobile-footer">AurumEdge Three-Pillar Mobile · {BUILD_VERSION} · All-timeframe sync · No broker connection · No automatic execution</div>', unsafe_allow_html=True)
+st.markdown(f'<div class="mobile-footer">AurumEdge SMA18/EMA Mobile · {BUILD_VERSION} · M15 signals · Telegram watcher · No broker connection · No automatic execution</div>', unsafe_allow_html=True)
