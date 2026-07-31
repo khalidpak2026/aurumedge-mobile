@@ -1,0 +1,9 @@
+{
+  "engine": "SMA18_EMA_M15",
+  "last_signal_id": "SMA18-M15:2026-07-31T20:30:00+00:00:BUY:Pullback",
+  "sent_signal_ids": [
+    "SMA18-M15:2026-07-31T20:30:00+00:00:BUY:Pullback"
+  ],
+  "updated_at": "2026-07-31T20:50:23.314348+00:00",
+  "version": 1
+}
