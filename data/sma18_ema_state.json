@@ -1,6 +1,6 @@
 {
   "engine": "SMA18_EMA_M15",
-  "last_signal_id": "SMA18-M15:2026-08-24T17:15:00+00:00:SELL:Pullback_+_Breakout",
+  "last_signal_id": "SMA18-M15:2026-08-25T02:45:00+00:00:SELL:Pullback_+_Breakout",
   "sent_signal_ids": [
     "SMA18-M15:2026-07-31T20:30:00+00:00:BUY:Pullback",
     "SMA18-M15:2026-08-11T11:00:00+00:00:BUY:Pullback_+_Breakout",
@@ -18,8 +18,9 @@
     "SMA18-M15:2026-08-21T13:00:00+00:00:BUY:Pullback",
     "SMA18-M15:2026-08-23T18:45:00+00:00:SELL:Pullback_+_Breakout",
     "SMA18-M15:2026-08-23T22:00:00+00:00:BUY:Pullback_+_Breakout",
-    "SMA18-M15:2026-08-24T17:15:00+00:00:SELL:Pullback_+_Breakout"
+    "SMA18-M15:2026-08-24T17:15:00+00:00:SELL:Pullback_+_Breakout",
+    "SMA18-M15:2026-08-25T02:45:00+00:00:SELL:Pullback_+_Breakout"
   ],
-  "updated_at": "2026-08-24T17:37:47.784329+00:00",
+  "updated_at": "2026-08-25T03:07:37.602708+00:00",
   "version": 1
 }
